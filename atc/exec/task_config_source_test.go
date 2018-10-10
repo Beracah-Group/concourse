@@ -3,12 +3,12 @@ package exec_test
 import (
 	"errors"
 
+	"github.com/concourse/baggageclaim"
 	"github.com/concourse/concourse/atc"
 	. "github.com/concourse/concourse/atc/exec"
 	"github.com/concourse/concourse/atc/exec/execfakes"
 	"github.com/concourse/concourse/atc/worker"
 	"github.com/concourse/concourse/atc/worker/workerfakes"
-	"github.com/concourse/baggageclaim"
 	yaml "gopkg.in/yaml.v2"
 
 	. "github.com/onsi/ginkgo"
@@ -303,7 +303,7 @@ run: {path: a/file}
 
 		Context("when the file's artifact source cannot be found in the repository", func() {
 			It("returns an UnknownArtifactSourceError", func() {
-				Expect(fetchErr).To(Equal(UnknownArtifactSourceError{"some"}))
+				Expect(fetchErr).To(Equal(UnknownArtifactSourceError{SourceName: "some", ConfigPath: "some/build.yml"}))
 			})
 		})
 	})

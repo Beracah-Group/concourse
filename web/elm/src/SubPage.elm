@@ -4,6 +4,7 @@ import Autoscroll
 import Build
 import Concourse
 import Html exposing (Html)
+import Html.Styled as HS
 import Http
 import Job
 import Json.Encode
@@ -138,11 +139,23 @@ init flags route =
 
         Routes.Dashboard ->
             superDupleWrap ( DashboardModel, DashboardMsg ) <|
-                Dashboard.init { title = setTitle } { turbulencePath = flags.turbulencePath, csrfToken = flags.csrfToken, search = querySearchForRoute route }
+                Dashboard.init
+                    { title = setTitle }
+                    { turbulencePath = flags.turbulencePath
+                    , csrfToken = flags.csrfToken
+                    , search = querySearchForRoute route
+                    , highDensity = False
+                    }
 
         Routes.DashboardHd ->
-            superDupleWrap ( DashboardHdModel, DashboardHdMsg ) <|
-                DashboardHd.init { title = setTitle } flags.turbulencePath (querySearchForRoute route)
+            superDupleWrap ( DashboardModel, DashboardMsg ) <|
+                Dashboard.init
+                    { title = setTitle }
+                    { turbulencePath = flags.turbulencePath
+                    , csrfToken = flags.csrfToken
+                    , search = querySearchForRoute route
+                    , highDensity = True
+                    }
 
 
 handleNotFound : String -> ( a -> Model, c -> Msg ) -> ( a, Cmd c, Maybe UpdateMsg ) -> ( Model, Cmd Msg )
@@ -282,7 +295,7 @@ view mdl =
             Html.map ResourceMsg <| Resource.view model
 
         DashboardModel model ->
-            Html.map DashboardMsg <| Dashboard.view model
+            (Html.map DashboardMsg << HS.toUnstyled) <| Dashboard.view model
 
         DashboardHdModel model ->
             Html.map DashboardHdMsg <| DashboardHd.view model

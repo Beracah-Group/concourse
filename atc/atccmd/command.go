@@ -42,13 +42,14 @@ import (
 	"github.com/concourse/concourse/atc/worker"
 	"github.com/concourse/concourse/atc/worker/image"
 	"github.com/concourse/concourse/atc/wrappa"
-	"github.com/concourse/flag"
-	"github.com/concourse/retryhttp"
 	"github.com/concourse/concourse/skymarshal"
 	"github.com/concourse/concourse/skymarshal/skycmd"
+	"github.com/concourse/concourse/skymarshal/storage"
 	"github.com/concourse/concourse/web"
+	"github.com/concourse/flag"
+	"github.com/concourse/retryhttp"
 	"github.com/cppforlife/go-semi-semantic/version"
-	"github.com/hashicorp/go-multierror"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/jessevdk/go-flags"
 	"github.com/tedsuo/ifrit"
 	"github.com/tedsuo/ifrit/grouper"
@@ -311,7 +312,7 @@ func (cmd *RunCommand) WireDynamicFlags(commandFlags *flags.Command) {
 }
 
 func (cmd *RunCommand) Execute(args []string) error {
-	runner, _, err := cmd.Runner(args)
+	runner, err := cmd.Runner(args)
 	if err != nil {
 		return err
 	}
@@ -319,7 +320,7 @@ func (cmd *RunCommand) Execute(args []string) error {
 	return <-ifrit.Invoke(sigmon.New(runner)).Wait()
 }
 
-func (cmd *RunCommand) Runner(positionalArguments []string) (ifrit.Runner, bool, error) {
+func (cmd *RunCommand) Runner(positionalArguments []string) (ifrit.Runner, error) {
 	if cmd.ExternalURL.URL == nil {
 		cmd.ExternalURL = cmd.defaultURL()
 	}
@@ -337,16 +338,44 @@ func (cmd *RunCommand) Runner(positionalArguments []string) (ifrit.Runner, bool,
 	})
 
 	if err := cmd.configureMetrics(logger); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	go metric.PeriodicallyEmit(logger.Session("periodic-metrics"), 10*time.Second)
 
-	members, err := cmd.constructMembers(positionalArguments, logger, reconfigurableSink)
+	lockConn, err := cmd.constructLockConn(retryingDriverName)
 	if err != nil {
-		return nil, false, err
+		return nil, err
+	}
+	lockFactory := lock.NewLockFactory(lockConn)
+
+	apiConn, err := cmd.constructDBConn(retryingDriverName, logger, 32, "api", lockFactory)
+	if err != nil {
+		return nil, err
 	}
 
-	return onReady(grouper.NewParallel(os.Interrupt, members), func() {
+	backendConn, err := cmd.constructDBConn(retryingDriverName, logger, 32, "backend", lockFactory)
+	if err != nil {
+		return nil, err
+	}
+
+	storage, err := storage.NewPostgresStorage(logger, cmd.Postgres)
+	if err != nil {
+		return nil, err
+	}
+
+	members, err := cmd.constructMembers(positionalArguments, logger, reconfigurableSink, apiConn, backendConn, storage, lockFactory)
+	if err != nil {
+		return nil, err
+	}
+
+	members = append(members, grouper.Member{
+		Name: "periodic-metrics",
+		Runner: metric.PeriodicallyEmit(
+			logger.Session("periodic-metrics"),
+			10*time.Second,
+		),
+	})
+
+	onReady := func() {
 		logData := lager.Data{
 			"http":  cmd.nonTLSBindAddr(),
 			"debug": cmd.debugBindAddr(),
@@ -357,13 +386,25 @@ func (cmd *RunCommand) Runner(positionalArguments []string) (ifrit.Runner, bool,
 		}
 
 		logger.Info("listening", logData)
-	}), false, nil
+	}
+
+	onExit := func() {
+		for _, closer := range []Closer{lockConn, apiConn, backendConn, storage} {
+			closer.Close()
+		}
+	}
+
+	return run(grouper.NewParallel(os.Interrupt, members), onReady, onExit), nil
 }
 
 func (cmd *RunCommand) constructMembers(
 	positionalArguments []string,
 	logger lager.Logger,
 	reconfigurableSink *lager.ReconfigurableSink,
+	apiConn db.Conn,
+	backendConn db.Conn,
+	storage storage.Storage,
+	lockFactory lock.LockFactory,
 ) ([]grouper.Member, error) {
 
 	if len(positionalArguments) != 0 {
@@ -374,6 +415,7 @@ func (cmd *RunCommand) constructMembers(
 	if err != nil {
 		return nil, err
 	}
+
 	if cmd.TelemetryOptIn {
 		url := fmt.Sprintf("http://telemetry.concourse-ci.org/?version=%s", Version)
 		go func() {
@@ -384,12 +426,12 @@ func (cmd *RunCommand) constructMembers(
 		}()
 	}
 
-	apiMembers, err := cmd.constructAPIMembers(logger, reconfigurableSink)
+	apiMembers, err := cmd.constructAPIMembers(logger, reconfigurableSink, apiConn, storage, lockFactory)
 	if err != nil {
 		return nil, err
 	}
 
-	backendMembers, err := cmd.constructBackendMembers(logger)
+	backendMembers, err := cmd.constructBackendMembers(logger, backendConn, lockFactory)
 	if err != nil {
 		return nil, err
 	}
@@ -400,21 +442,13 @@ func (cmd *RunCommand) constructMembers(
 func (cmd *RunCommand) constructAPIMembers(
 	logger lager.Logger,
 	reconfigurableSink *lager.ReconfigurableSink,
+	dbConn db.Conn,
+	storage storage.Storage,
+	lockFactory lock.LockFactory,
 ) ([]grouper.Member, error) {
-	connectionName := "api"
-	maxConns := 32
-
-	lockFactory, err := cmd.lockFactory()
-	if err != nil {
-		return nil, err
-	}
-	dbConn, err := cmd.constructDBConn(retryingDriverName, logger, maxConns, connectionName, lockFactory)
-	if err != nil {
-		return nil, err
-	}
 	teamFactory := db.NewTeamFactory(dbConn, lockFactory)
 
-	_, err = teamFactory.CreateDefaultTeamIfNotExists()
+	_, err := teamFactory.CreateDefaultTeamIfNotExists()
 	if err != nil {
 		return nil, err
 	}
@@ -427,13 +461,14 @@ func (cmd *RunCommand) constructAPIMembers(
 	if err != nil {
 		return nil, err
 	}
+
 	authHandler, err := skymarshal.NewServer(&skymarshal.Config{
 		Logger:      logger,
 		TeamFactory: teamFactory,
 		Flags:       cmd.Auth.AuthFlags,
 		ExternalURL: cmd.ExternalURL.String(),
 		HttpClient:  httpClient,
-		Postgres:    cmd.Postgres,
+		Storage:     storage,
 	})
 	if err != nil {
 		return nil, err
@@ -620,6 +655,8 @@ func (cmd *RunCommand) constructAPIMembers(
 
 func (cmd *RunCommand) constructBackendMembers(
 	logger lager.Logger,
+	dbConn db.Conn,
+	lockFactory lock.LockFactory,
 ) ([]grouper.Member, error) {
 
 	if cmd.Syslog.Address != "" && cmd.Syslog.Transport == "" {
@@ -631,18 +668,8 @@ func (cmd *RunCommand) constructBackendMembers(
 		syslogDrainConfigured = false
 	}
 
-	connectionName := "backend"
-	maxConns := 32
-
 	drain := make(chan struct{})
-	lockFactory, err := cmd.lockFactory()
-	if err != nil {
-		return nil, err
-	}
-	dbConn, err := cmd.constructDBConn(retryingDriverName, logger, maxConns, connectionName, lockFactory)
-	if err != nil {
-		return nil, err
-	}
+
 	teamFactory := db.NewTeamFactory(dbConn, lockFactory)
 
 	dbResourceCacheFactory := db.NewResourceCacheFactory(dbConn, lockFactory)
@@ -752,6 +779,7 @@ func (cmd *RunCommand) constructBackendMembers(
 				gc.NewResourceCacheCollector(dbResourceCacheLifecycle),
 				gc.NewVolumeCollector(
 					dbVolumeRepository,
+					cmd.GC.Interval*3, // volume missing-since grace period (must be larger than gc.interval so it doesn't race)
 				),
 				gc.NewContainerCollector(
 					dbContainerRepository,
@@ -760,6 +788,7 @@ func (cmd *RunCommand) constructBackendMembers(
 						workerProvider,
 						time.Minute,
 					),
+					cmd.GC.Interval*3, // container missing-since grace period (must be larger than gc.interval so it doesn't race)
 				),
 				gc.NewResourceConfigCheckSessionCollector(
 					resourceConfigCheckSessionLifecycle,
@@ -859,15 +888,6 @@ func (cmd *RunCommand) variablesFactory(logger lager.Logger) (creds.VariablesFac
 		break
 	}
 	return variablesFactory, nil
-}
-
-func (cmd *RunCommand) lockFactory() (lock.LockFactory, error) {
-	lockConn, err := cmd.constructLockConn(retryingDriverName)
-	if err != nil {
-		return nil, err
-	}
-
-	return lock.NewLockFactory(lockConn), nil
 }
 
 func (cmd *RunCommand) newKey() *encryption.Key {
@@ -1002,7 +1022,7 @@ func (cmd *RunCommand) defaultURL() flag.URL {
 	}
 }
 
-func onReady(runner ifrit.Runner, cb func()) ifrit.Runner {
+func run(runner ifrit.Runner, onReady func(), onExit func()) ifrit.Runner {
 	return ifrit.RunFunc(func(signals <-chan os.Signal, ready chan<- struct{}) error {
 		process := ifrit.Background(runner)
 
@@ -1012,10 +1032,11 @@ func onReady(runner ifrit.Runner, cb func()) ifrit.Runner {
 		for {
 			select {
 			case <-subReady:
-				cb()
+				onReady()
 				close(ready)
 				subReady = nil
 			case err := <-subExited:
+				onExit()
 				return err
 			case sig := <-signals:
 				process.Signal(sig)
@@ -1103,6 +1124,10 @@ func (cmd *RunCommand) constructDBConn(
 	return dbConn, nil
 }
 
+type Closer interface {
+	Close() error
+}
+
 func (cmd *RunCommand) constructLockConn(driverName string) (*sql.DB, error) {
 	dbConn, err := sql.Open(driverName, cmd.Postgres.ConnectionString())
 	if err != nil {
@@ -1150,11 +1175,7 @@ func (cmd *RunCommand) configureAuthForDefaultTeam(teamFactory db.TeamFactory) e
 		return fmt.Errorf("default team auth not configured: %v", err)
 	}
 
-	teamAuth := atc.TeamAuth{
-		cmd.Auth.MainTeamFlags.TeamRole: auth,
-	}
-
-	err = team.UpdateProviderAuth(teamAuth)
+	err = team.UpdateProviderAuth(atc.TeamAuth(auth))
 	if err != nil {
 		return err
 	}

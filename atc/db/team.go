@@ -746,26 +746,12 @@ func (t *team) UpdateProviderAuth(auth atc.TeamAuth) error {
 	}
 	defer Rollback(tx)
 
+	jsonEncodedProviderAuth, err := json.Marshal(auth)
+	if err != nil {
+		return err
+	}
+
 	query := `
-		SELECT id, name, admin, auth, nonce
-		FROM teams
-		WHERE id = $1
-	`
-	err = t.queryTeam(tx, query, t.id)
-	if err != nil {
-		return err
-	}
-
-	for role, roleAuth := range auth {
-		t.auth[role] = roleAuth
-	}
-
-	jsonEncodedProviderAuth, err := json.Marshal(t.auth)
-	if err != nil {
-		return err
-	}
-
-	query = `
 		UPDATE teams
 		SET auth = $1, legacy_auth = NULL, nonce = NULL
 		WHERE id = $2
@@ -1003,14 +989,12 @@ func (t *team) queryTeam(tx Tx, query string, params ...interface{}) error {
 	}
 
 	if providerAuth.Valid {
-		err = json.Unmarshal([]byte(providerAuth.String), &t.auth)
+		var auth atc.TeamAuth
+		err = json.Unmarshal([]byte(providerAuth.String), &auth)
 		if err != nil {
 			return err
 		}
-	}
-
-	if t.auth == nil {
-		t.auth = atc.TeamAuth{}
+		t.auth = auth
 	}
 
 	return nil

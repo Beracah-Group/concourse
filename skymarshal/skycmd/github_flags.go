@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/concourse/flag"
 	"github.com/concourse/dex/connector/github"
-	"github.com/hashicorp/go-multierror"
+	"github.com/concourse/flag"
+	multierror "github.com/hashicorp/go-multierror"
 )
 
 func init() {
@@ -48,11 +48,12 @@ func (self *GithubFlags) Serialize(redirectURI string) ([]byte, error) {
 	}
 
 	return json.Marshal(github.Config{
-		ClientID:     self.ClientID,
-		ClientSecret: self.ClientSecret,
-		RedirectURI:  redirectURI,
-		HostName:     self.Host,
-		RootCA:       self.CACert.Path(),
+		ClientID:      self.ClientID,
+		ClientSecret:  self.ClientSecret,
+		RedirectURI:   redirectURI,
+		HostName:      self.Host,
+		RootCA:        self.CACert.Path(),
+		TeamNameField: "both",
 	})
 }
 

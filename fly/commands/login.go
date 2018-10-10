@@ -2,13 +2,13 @@ package commands
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/concourse/concourse/atc"
@@ -23,6 +23,7 @@ import (
 type LoginCommand struct {
 	ATCURL      string       `short:"c" long:"concourse-url" description:"Concourse URL to authenticate with"`
 	Insecure    bool         `short:"k" long:"insecure" description:"Skip verification of the endpoint's SSL certificate"`
+	Remote      bool         `short:"r" long:"remote" description:"Login redirect to token page on browser"`
 	Username    string       `short:"u" long:"username" description:"Username for basic auth"`
 	Password    string       `short:"p" long:"password" description:"Password for basic auth"`
 	TeamName    string       `short:"n" long:"team-name" description:"Team to authenticate with"`
@@ -127,6 +128,11 @@ func (command *LoginCommand) Execute(args []string) error {
 
 	fmt.Println("")
 
+	err = checkTokenTeams(tokenValue, command.TeamName)
+	if err != nil {
+		return err
+	}
+
 	return command.saveTarget(
 		client.URL(),
 		&rc.TargetToken{
@@ -169,17 +175,25 @@ func (command *LoginCommand) authCodeGrant(targetUrl string) (string, string, er
 
 	port := <-portChannel
 
-	redirectUri, err := url.Parse("http://127.0.0.1:" + port + "/auth/callback")
-	if err != nil {
-		panic(err)
-	}
-
-	openURL := fmt.Sprintf("%s/sky/login?redirect_uri=%s", targetUrl, redirectUri.String())
+	var openURL string
 
 	fmt.Println("navigate to the following URL in your browser:")
 	fmt.Println("")
-	fmt.Printf("  %s\n", openURL)
-	fmt.Println("")
+
+	if command.Remote {
+		openURL = fmt.Sprintf("%s/sky/login?redirect_uri=%s", targetUrl, "/sky/token")
+
+		fmt.Printf("  %s\n", openURL)
+		fmt.Println("")
+		fmt.Printf("and enter token manually: ")
+	} else {
+		redirectUri := "http://127.0.0.1:" + port + "/auth/callback"
+		openURL = fmt.Sprintf("%s/sky/login?redirect_uri=%s", targetUrl, redirectUri)
+
+		fmt.Printf("  %s\n", openURL)
+		fmt.Println("")
+		fmt.Printf("or enter token manually: ")
+	}
 
 	if command.OpenBrowser {
 		// try to open the browser window, but don't get all hung up if it
@@ -201,6 +215,36 @@ func (command *LoginCommand) authCodeGrant(targetUrl string) (string, string, er
 	segments := strings.SplitN(tokenStr, " ", 2)
 
 	return segments[0], segments[1], nil
+}
+
+func checkTokenTeams(tokenValue string, loggingTeam string) error {
+
+	tokenContents := strings.Split(tokenValue, ".")
+	if len(tokenContents) < 2 {
+		return nil
+	}
+
+	rawData, err := base64.StdEncoding.WithPadding(base64.NoPadding).DecodeString(tokenContents[1])
+	if err != nil {
+		return err
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(rawData, &payload); err != nil {
+		return err
+	}
+
+	teams := payload["teams"].([]interface{})
+	userName := payload["user_name"].(string)
+	for _, team := range teams {
+		tokenTeam := strings.Split(team.(string), ":")[0]
+
+		if loggingTeam == tokenTeam {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("user [%s] is not in team [%s]", userName, loggingTeam)
 }
 
 func listenForTokenCallback(tokenChannel chan string, errorChannel chan error, portChannel chan string, targetUrl string) {
@@ -242,8 +286,6 @@ type tcpKeepAliveListener struct {
 
 func waitForTokenInput(tokenChannel chan string, errorChannel chan error) {
 	for {
-		fmt.Printf("or enter token manually: ")
-
 		var tokenType string
 		var tokenValue string
 		count, err := fmt.Scanf("%s %s", &tokenType, &tokenValue)
@@ -365,6 +407,7 @@ func (command *LoginCommand) legacyAuth(target rc.Target) (string, string, error
 		fmt.Println("")
 		fmt.Printf("    %s", theURL)
 		fmt.Println("")
+		fmt.Printf("or enter token manually: ")
 
 		if command.OpenBrowser {
 			// try to open the browser window, but don't get all hung up if it
