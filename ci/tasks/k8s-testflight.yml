@@ -3,15 +3,13 @@ platform: linux
 
 image_resource:
   type: registry-image
-  source: {repository: concourse/k8s-testflight}
+  source: {repository: concourse/k8s-dev}
 
 inputs:
 - name: concourse
-- name: version
-- name: charts
 
 params:
-  RELEASE_NAME:
+  RELEASE_NAME: concourse
   KUBE_CONFIG:
   ATC_USERNAME:
   ATC_PASSWORD:

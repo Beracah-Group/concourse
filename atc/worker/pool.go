@@ -35,29 +35,21 @@ type WorkerProvider interface {
 		logger lager.Logger,
 		tikTok clock.Clock,
 		savedWorker db.Worker,
+		numBuildWorkers int,
 	) Worker
 }
 
 var (
-	ErrNoWorkers = errors.New("no workers")
+	ErrNoWorkers       = errors.New("no workers")
+	ErrNoGlobalWorkers = errors.New("no global workers available")
 )
 
 type NoCompatibleWorkersError struct {
-	Spec    WorkerSpec
-	Workers []Worker
+	Spec WorkerSpec
 }
 
 func (err NoCompatibleWorkersError) Error() string {
-	availableWorkers := ""
-	for _, worker := range err.Workers {
-		availableWorkers += "\n  - " + worker.Description()
-	}
-
-	return fmt.Sprintf(
-		"no workers satisfying: %s\n\navailable workers: %s",
-		err.Spec.Description(),
-		availableWorkers,
-	)
+	return fmt.Sprintf("no workers satisfying: %s", err.Spec.Description())
 }
 
 type pool struct {
@@ -75,11 +67,7 @@ func NewPool(provider WorkerProvider, strategy ContainerPlacementStrategy) Clien
 	}
 }
 
-func (pool *pool) RunningWorkers(logger lager.Logger) ([]Worker, error) {
-	return pool.provider.RunningWorkers(logger)
-}
-
-func (pool *pool) AllSatisfying(logger lager.Logger, spec WorkerSpec, resourceTypes creds.VersionedResourceTypes) ([]Worker, error) {
+func (pool *pool) allSatisfying(logger lager.Logger, spec WorkerSpec) ([]Worker, error) {
 	workers, err := pool.provider.RunningWorkers(logger)
 	if err != nil {
 		return nil, err
@@ -92,7 +80,7 @@ func (pool *pool) AllSatisfying(logger lager.Logger, spec WorkerSpec, resourceTy
 	compatibleTeamWorkers := []Worker{}
 	compatibleGeneralWorkers := []Worker{}
 	for _, worker := range workers {
-		satisfyingWorker, err := worker.Satisfying(logger, spec, resourceTypes)
+		satisfyingWorker, err := worker.Satisfying(logger, spec)
 		if err == nil {
 			if worker.IsOwnedByTeam() {
 				compatibleTeamWorkers = append(compatibleTeamWorkers, satisfyingWorker)
@@ -110,14 +98,17 @@ func (pool *pool) AllSatisfying(logger lager.Logger, spec WorkerSpec, resourceTy
 		return compatibleGeneralWorkers, nil
 	}
 
+	if spec.TeamID == 0 {
+		return nil, ErrNoGlobalWorkers
+	}
+
 	return nil, NoCompatibleWorkersError{
-		Spec:    spec,
-		Workers: workers,
+		Spec: spec,
 	}
 }
 
-func (pool *pool) Satisfying(logger lager.Logger, spec WorkerSpec, resourceTypes creds.VersionedResourceTypes) (Worker, error) {
-	compatibleWorkers, err := pool.AllSatisfying(logger, spec, resourceTypes)
+func (pool *pool) Satisfying(logger lager.Logger, spec WorkerSpec) (Worker, error) {
+	compatibleWorkers, err := pool.allSatisfying(logger, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -131,12 +122,13 @@ func (pool *pool) FindOrCreateContainer(
 	delegate ImageFetchingDelegate,
 	owner db.ContainerOwner,
 	metadata db.ContainerMetadata,
-	spec ContainerSpec,
+	containerSpec ContainerSpec,
+	workerSpec WorkerSpec,
 	resourceTypes creds.VersionedResourceTypes,
 ) (Container, error) {
 	worker, found, err := pool.provider.FindWorkerForContainerByOwner(
 		logger.Session("find-worker"),
-		spec.TeamID,
+		workerSpec.TeamID,
 		owner,
 	)
 	if err != nil {
@@ -144,12 +136,12 @@ func (pool *pool) FindOrCreateContainer(
 	}
 
 	if !found {
-		compatibleWorkers, err := pool.AllSatisfying(logger, spec.WorkerSpec(), resourceTypes)
+		compatibleWorkers, err := pool.allSatisfying(logger, workerSpec)
 		if err != nil {
 			return nil, err
 		}
 
-		worker, err = pool.strategy.Choose(compatibleWorkers, spec)
+		worker, err = pool.strategy.Choose(logger, compatibleWorkers, containerSpec)
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +153,8 @@ func (pool *pool) FindOrCreateContainer(
 		delegate,
 		owner,
 		metadata,
-		spec,
+		containerSpec,
+		workerSpec,
 		resourceTypes,
 	)
 }

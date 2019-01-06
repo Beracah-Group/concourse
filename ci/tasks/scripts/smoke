@@ -1,0 +1,49 @@
+#!/bin/bash
+# vim: set ft=sh
+
+set -e -u
+
+export MAX_TICKS="${MAX_TICKS:-60}"
+readonly DIR=$(cd $(dirname $0) && pwd)
+
+instance_ip="$(cat endpoint-info/instance_ip)"
+
+test -n "$instance_ip"
+
+export ATC_URL="http://${instance_ip}:8080"
+
+if [ -e endpoint-info/admin_username ]; then
+  export ATC_ADMIN_USERNAME="$(cat endpoint-info/admin_username)"
+else
+  export ATC_ADMIN_USERNAME=admin
+fi
+if [ -e endpoint-info/admin_password ]; then
+  export ATC_ADMIN_PASSWORD="$(cat endpoint-info/admin_password)"
+else
+  export ATC_ADMIN_PASSWORD=admin
+fi
+
+if [ -e endpoint-info/guest_username ]; then
+  export ATC_GUEST_USERNAME="$(cat endpoint-info/guest_username)"
+else
+  export ATC_GUEST_USERNAME=guest
+fi
+if [ -e endpoint-info/guest_password ]; then
+  export ATC_GUEST_PASSWORD="$(cat endpoint-info/guest_password)"
+else
+  export ATC_GUEST_PASSWORD=guest
+fi
+
+$DIR/wait-atc
+
+if curl "$ATC_URL/api/v1/cli?arch=amd64&platform=linux" --fail -o /usr/local/bin/fly; then
+  chmod +x /usr/local/bin/fly
+else
+  pushd concourse/fly
+    go build -o /usr/local/bin/fly
+  popd
+fi
+
+fly --version
+
+$DIR/watsjs test/smoke.js

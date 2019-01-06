@@ -1,7 +1,5 @@
-trap {
-  write-error $_
-  exit 1
-}
+$ErrorActionPreference = "Stop"
+trap { $host.SetShouldExit(1) }
 
 $env:Path += ";C:\Go\bin;C:\Program Files\Git\cmd"
 
@@ -13,7 +11,7 @@ $env:Path += ";$pwd\gopath\bin"
 $ldflags = "-X noop.Noop=noop"
 if ([System.IO.File]::Exists("final-version\version")) {
   [string]$FinalVersion = (Get-Content "final-version\version")
-  $ldflags = "-X github.com/concourse/concourse/fly/version.Version=$FinalVersion"
+  $ldflags = "-X github.com/concourse/concourse.Version=$FinalVersion"
 }
 
 Push-Location concourse

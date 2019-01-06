@@ -30,6 +30,7 @@ type Volume interface {
 
 	CreateChildForContainer(db.CreatingContainer, string) (db.CreatingVolume, error)
 
+	WorkerName() string
 	Destroy() error
 }
 
@@ -42,6 +43,20 @@ type volume struct {
 	bcVolume     baggageclaim.Volume
 	dbVolume     db.CreatedVolume
 	volumeClient VolumeClient
+}
+
+type byMountPath []VolumeMount
+
+func (p byMountPath) Len() int {
+	return len(p)
+}
+func (p byMountPath) Swap(i, j int) {
+	p[i], p[j] = p[j], p[i]
+}
+func (p byMountPath) Less(i, j int) bool {
+	path1 := p[i].MountPath
+	path2 := p[j].MountPath
+	return path1 < path2
 }
 
 func NewVolume(
@@ -78,6 +93,10 @@ func (v *volume) StreamOut(path string) (io.ReadCloser, error) {
 
 func (v *volume) Properties() (baggageclaim.VolumeProperties, error) {
 	return v.bcVolume.Properties()
+}
+
+func (v *volume) WorkerName() string {
+	return v.dbVolume.WorkerName()
 }
 
 func (v *volume) Destroy() error {

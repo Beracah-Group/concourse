@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 
-	"code.cloudfoundry.org/clock"
 	"code.cloudfoundry.org/lager"
 	"github.com/concourse/concourse/atc"
 	"github.com/concourse/concourse/atc/creds"
@@ -54,20 +53,17 @@ type imageResourceFetcherFactory struct {
 	resourceFetcherFactory  resource.FetcherFactory
 	dbResourceCacheFactory  db.ResourceCacheFactory
 	dbResourceConfigFactory db.ResourceConfigFactory
-	clock                   clock.Clock
 }
 
 func NewImageResourceFetcherFactory(
 	resourceFetcherFactory resource.FetcherFactory,
 	dbResourceCacheFactory db.ResourceCacheFactory,
 	dbResourceConfigFactory db.ResourceConfigFactory,
-	clock clock.Clock,
 ) ImageResourceFetcherFactory {
 	return &imageResourceFetcherFactory{
 		resourceFetcherFactory:  resourceFetcherFactory,
 		dbResourceCacheFactory:  dbResourceCacheFactory,
 		dbResourceConfigFactory: dbResourceConfigFactory,
-		clock:                   clock,
 	}
 }
 
@@ -85,7 +81,6 @@ func (f *imageResourceFetcherFactory) NewImageResourceFetcher(
 		resourceFactory:         resourceFactory,
 		dbResourceCacheFactory:  f.dbResourceCacheFactory,
 		dbResourceConfigFactory: f.dbResourceConfigFactory,
-		clock:                   f.clock,
 
 		worker:                worker,
 		imageResource:         imageResource,
@@ -102,7 +97,6 @@ type imageResourceFetcher struct {
 	resourceFactory         resource.ResourceFactory
 	dbResourceCacheFactory  db.ResourceCacheFactory
 	dbResourceConfigFactory db.ResourceConfigFactory
-	clock                   clock.Clock
 
 	imageResource         worker.ImageResource
 	version               atc.Version
@@ -158,7 +152,7 @@ func (i *imageResourceFetcher) Fetch(
 		params,
 		i.customTypes,
 		resourceCache,
-		db.NewImageGetContainerOwner(container),
+		db.NewImageGetContainerOwner(container, i.teamID),
 	)
 
 	err = i.imageFetchingDelegate.ImageVersionDetermined(resourceCache)
@@ -228,7 +222,7 @@ func (i *imageResourceFetcher) ensureVersionOfType(
 	checkResourceType, err := i.resourceFactory.NewResource(
 		ctx,
 		logger,
-		db.NewImageCheckContainerOwner(container),
+		db.NewImageCheckContainerOwner(container, i.teamID),
 		db.ContainerMetadata{
 			Type: db.ContainerTypeCheck,
 		},
@@ -236,9 +230,15 @@ func (i *imageResourceFetcher) ensureVersionOfType(
 			ImageSpec: worker.ImageSpec{
 				ResourceType: resourceType.Name,
 			},
-			Tags:   i.worker.Tags(),
 			TeamID: i.teamID,
-		}, i.customTypes,
+			Tags:   i.worker.Tags(),
+		},
+		worker.WorkerSpec{
+			ResourceType:  resourceType.Name,
+			Tags:          i.worker.Tags(),
+			ResourceTypes: i.customTypes,
+		},
+		i.customTypes,
 		worker.NoopImageFetchingDelegate{},
 	)
 	if err != nil {
@@ -288,6 +288,12 @@ func (i *imageResourceFetcher) getLatestVersion(
 		TeamID: i.teamID,
 	}
 
+	workerSpec := worker.WorkerSpec{
+		ResourceType:  i.imageResource.Type,
+		Tags:          i.worker.Tags(),
+		ResourceTypes: i.customTypes,
+	}
+
 	source, err := i.imageResource.Source.Evaluate()
 	if err != nil {
 		return nil, err
@@ -296,11 +302,12 @@ func (i *imageResourceFetcher) getLatestVersion(
 	checkingResource, err := i.resourceFactory.NewResource(
 		ctx,
 		logger,
-		db.NewImageCheckContainerOwner(container),
+		db.NewImageCheckContainerOwner(container, i.teamID),
 		db.ContainerMetadata{
 			Type: db.ContainerTypeCheck,
 		},
 		resourceSpec,
+		workerSpec,
 		i.customTypes,
 		i.imageFetchingDelegate,
 	)

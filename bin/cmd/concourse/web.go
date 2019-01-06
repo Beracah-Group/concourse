@@ -43,6 +43,10 @@ func (cmd *WebCommand) Execute(args []string) error {
 }
 
 func (cmd *WebCommand) Runner(args []string) (ifrit.Runner, error) {
+	if cmd.RunCommand.CLIArtifactsDir == "" {
+		cmd.RunCommand.CLIArtifactsDir = flag.Dir(discoverAsset("fly-assets"))
+	}
+
 	cmd.populateTSAFlagsFromATCFlags()
 
 	atcRunner, err := cmd.RunCommand.Runner(args)
@@ -55,9 +59,16 @@ func (cmd *WebCommand) Runner(args []string) (ifrit.Runner, error) {
 		return nil, err
 	}
 
+	logger, _ := cmd.RunCommand.Logger.Logger("web")
 	return grouper.NewParallel(os.Interrupt, grouper.Members{
-		{Name: "atc", Runner: atcRunner},
-		{Name: "tsa", Runner: tsaRunner},
+		{
+			Name:   "atc",
+			Runner: NewLoggingRunner(logger.Session("atc-runner"), atcRunner),
+		},
+		{
+			Name:   "tsa",
+			Runner: NewLoggingRunner(logger.Session("tsa-runner"), tsaRunner),
+		},
 	}), nil
 }
 

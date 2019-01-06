@@ -12,6 +12,17 @@
     <script src="{{asset "graph.js"}}"></script>
     <script src="{{asset "jquery-2.1.1.min.js"}}"></script>
     <script src="{{asset "elm.min.js"}}"></script>
+    <script src="{{asset "clipboard.min.js"}}"></script>
+    <style>
+        @keyframes pipeline-running {
+          0% { background-position-x: -53.5px; }
+          100% { background-position-x: 0; }
+        }
+        @-webkit-keyframes pipeline-running {
+          0% { background-position-x: -53.5px; }
+          100% { background-position-x: 0; }
+        }
+    </style>
   </head>
   <body>
     <div id="elm-app-embed"></div>
@@ -22,7 +33,9 @@
       var app = Elm.Main.embed(node, {
         turbulenceImgSrc: {{asset "images/buckleup.svg"}},
         notFoundImgSrc: {{asset "images/parachute_error_404.svg"}},
-        csrfToken: {{ .CSRFToken }}
+        csrfToken: {{ .CSRFToken }},
+        authToken: {{ .AuthToken }},
+        pipelineRunningKeyframes: "pipeline-running"
       });
       var resizeTimer;
 
@@ -32,15 +45,16 @@
         body = (section) => Array.from(section.childNodes).find(n => n.classList && n.classList.contains(config.sectionBodyClass));
         lowestHeaderTop = (section) => body(section).offsetTop + body(section).scrollHeight - header(section).scrollHeight;
 
-        pageHeaderHeight = () => document.querySelector("." + config.pageHeaderClass).offsetHeight;
+        pageHeaderHeight = () => config.pageHeaderHeight;
         viewportTop = () => window.pageYOffset + pageHeaderHeight();
 
         updateHeader = (section) => {
           var scrolledFarEnough = section.offsetTop < viewportTop();
           var scrolledTooFar = lowestHeaderTop(section) < viewportTop();
           if (!scrolledFarEnough && !scrolledTooFar) {
-            header(section).removeAttribute('style');
-            body(section).removeAttribute('style');
+            header(section).style.top = "";
+            header(section).style.position = "";
+            body(section).style.paddingTop = "";
             return 'static';
           } else if (scrolledFarEnough && !scrolledTooFar) {
             header(section).style.position = 'fixed';
@@ -84,7 +98,7 @@
         var path = document.location.pathname;
         var query = document.location.search;
         var redirect = encodeURIComponent(path + query);
-        var loginUrl = "/sky/login?redirect_uri="+ redirect;
+        var loginUrl = "/login?redirect_uri="+ redirect;
         document.location.href = loginUrl;
       });
 
@@ -98,8 +112,8 @@
         var pipelineName = pipelineInfo[0];
         var pipelineTeamName = pipelineInfo[1];
 
-        var team = $('#' + pipelineTeamName);
-        var title = team.find('.dashboard-pipeline[data-pipeline-name="' + pipelineName + '"]').find('.dashboard-pipeline-name');
+        var team = $('div[id="' + pipelineTeamName + '"]');
+        var title = team.find('.card[data-pipeline-name="' + pipelineName + '"]').find('.dashboard-pipeline-name');
 
         if(title.get(0).offsetWidth < title.get(0).scrollWidth){
             title.parent().attr('data-tooltip', pipelineName);
@@ -110,7 +124,7 @@
         var pipelineName = pipelineInfo[0];
         var pipelineTeamName = pipelineInfo[1];
 
-        var title = $('.dashboard-pipeline[data-pipeline-name="' + pipelineName + '"][data-team-name="' + pipelineTeamName + '"]').find('.dashboardhd-pipeline-name');
+        var title = $('.card[data-pipeline-name="' + pipelineName + '"][data-team-name="' + pipelineTeamName + '"]').find('.dashboardhd-pipeline-name');
 
         if(title.get(0).offsetWidth < title.get(0).scrollWidth){
             title.parent().attr('data-tooltip', pipelineName);
@@ -130,6 +144,9 @@
         }
       }, false);
 
+    </script>
+    <script>
+      var clipboard = new ClipboardJS('#copy-token');
     </script>
   </body>
 </html>

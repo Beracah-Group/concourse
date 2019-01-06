@@ -82,12 +82,13 @@ type GetPlan struct {
 }
 
 type PutPlan struct {
-	Type     string `json:"type"`
-	Name     string `json:"name,omitempty"`
-	Resource string `json:"resource"`
-	Source   Source `json:"source"`
-	Params   Params `json:"params,omitempty"`
-	Tags     Tags   `json:"tags,omitempty"`
+	Type     string   `json:"type"`
+	Name     string   `json:"name,omitempty"`
+	Resource string   `json:"resource"`
+	Source   Source   `json:"source"`
+	Params   Params   `json:"params,omitempty"`
+	Tags     Tags     `json:"tags,omitempty"`
+	Inputs   []string `json:"inputs,omitempty"`
 
 	VersionedResourceTypes VersionedResourceTypes `json:"resource_types,omitempty"`
 }
@@ -100,6 +101,7 @@ type TaskPlan struct {
 
 	ConfigPath string      `json:"config_path,omitempty"`
 	Config     *TaskConfig `json:"config,omitempty"`
+	Vars       Params      `json:"vars,omitempty"`
 
 	Params            Params            `json:"params,omitempty"`
 	InputMapping      map[string]string `json:"input_mapping,omitempty"`

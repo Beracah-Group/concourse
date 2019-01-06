@@ -1,19 +1,12 @@
 ---
 resource_types:
-- name: registry-image
-  type: registry-image
-  source:
-    repository: concourse/registry-image-resource
-
 - name: bosh-deployment
   type: registry-image
-  source:
-    repository: cloudfoundry/bosh-deployment-resource
+  source: {repository: cloudfoundry/bosh-deployment-resource}
 
 - name: pull-request
   type: registry-image
-  source:
-    repository: teliaoss/github-pr-resource
+  source: {repository: teliaoss/github-pr-resource}
 
 
 resources:
@@ -21,6 +14,12 @@ resources:
   type: pull-request
   source:
     repository: concourse/concourse
+    access_token: ((pull_requests_access_token))
+
+- name: baggageclaim-pr
+  type: pull-request
+  source:
+    repository: concourse/baggageclaim
     access_token: ((pull_requests_access_token))
 
 - name: dev-image
@@ -35,6 +34,7 @@ resources:
 jobs:
 - name: unit
   public: true
+  serial: true
   on_failure:
     put: concourse-pr
     params: {path: concourse-pr, status: failure, context: unit}
@@ -51,12 +51,14 @@ jobs:
     file: concourse-pr/ci/tasks/yarn-test.yml
     input_mapping: {concourse: concourse-pr}
   - task: unit
+    timeout: 1h
     file: concourse-pr/ci/tasks/unit.yml
     input_mapping: {concourse: built-concourse}
     tags: [pr]
 
 - name: testflight
   public: true
+  serial: true
   on_failure:
     put: concourse-pr
     params: {path: concourse-pr, status: failure, context: testflight}
@@ -78,6 +80,7 @@ jobs:
     file: concourse-pr/ci/tasks/yarn-build.yml
     input_mapping: {concourse: concourse-pr}
   - task: testflight
+    timeout: 1h
     privileged: true
     file: concourse-pr/ci/tasks/docker-compose-testflight.yml
     input_mapping: {concourse: built-concourse}
@@ -85,6 +88,7 @@ jobs:
 
 - name: watsjs
   public: true
+  serial: true
   on_failure:
     put: concourse-pr
     params: {path: concourse-pr, status: failure, context: watsjs}
@@ -106,7 +110,29 @@ jobs:
     file: concourse-pr/ci/tasks/yarn-build.yml
     input_mapping: {concourse: concourse-pr}
   - task: watsjs
+    timeout: 1h
     privileged: true
     file: concourse-pr/ci/tasks/docker-compose-watsjs.yml
     input_mapping: {concourse: built-concourse}
+    tags: [pr]
+
+- name: baggageclaim
+  public: true
+  on_failure:
+    put: baggageclaim-pr
+    params: {path: baggageclaim-pr, status: failure, context: baggageclaim}
+  on_success:
+    put: baggageclaim-pr
+    params: {path: baggageclaim-pr, status: success, context: baggageclaim}
+  plan:
+  - get: baggageclaim-pr
+    trigger: true
+    version: every
+  - put: baggageclaim-pr
+    params: {path: baggageclaim-pr, status: pending, context: baggageclaim}
+  - task: unit-linux
+    privileged: true
+    timeout: 1h
+    file: baggageclaim-pr/ci/unit-linux.yml
+    input_mapping: {baggageclaim: baggageclaim-pr}
     tags: [pr]

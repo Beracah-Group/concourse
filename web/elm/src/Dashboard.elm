@@ -1,38 +1,64 @@
-port module Dashboard exposing (Model, Msg, init, subscriptions, update, view)
+port module Dashboard exposing
+    ( Effect(..)
+    , Model
+    , init
+    , subscriptions
+    , toCmd
+    , update
+    , view
+    )
 
+import Array
 import Char
 import Concourse
-import Concourse.Cli
+import Concourse.Cli as Cli
 import Concourse.Pipeline
-import Concourse.PipelineStatus
+import Concourse.PipelineStatus as PipelineStatus exposing (PipelineStatus(..))
 import Concourse.User
-import Css
+import Dashboard.APIData as APIData
 import Dashboard.Details as Details
+import Dashboard.Footer as Footer
 import Dashboard.Group as Group
-import Dashboard.GroupWithTag as GroupWithTag
-import Dashboard.Pipeline as Pipeline
+import Dashboard.Models as Models
+import Dashboard.Msgs as Msgs exposing (Msg(..))
+import Dashboard.Styles as Styles
 import Dashboard.SubState as SubState
-import DashboardHd
+import Dashboard.Text as Text
 import Dom
 import Html.Styled as Html exposing (Html)
-import Html.Styled.Attributes exposing (attribute, css, class, classList, draggable, href, id, src)
+import Html.Styled.Attributes
+    exposing
+        ( attribute
+        , class
+        , classList
+        , css
+        , draggable
+        , href
+        , id
+        , src
+        , style
+        )
+import Html.Styled.Events exposing (onMouseEnter, onMouseLeave)
 import Http
 import Keyboard
-import List.Extra
-import Maybe.Extra
-import Mouse
-import Monocle.Common exposing ((=>), (<|>))
-import Monocle.Optional
+import LoginRedirect
+import Monocle.Common exposing ((<|>), (=>))
 import Monocle.Lens
+import Monocle.Optional
 import MonocleHelpers exposing (..)
+import Mouse
+import Navigation
 import NewTopBar
-import NoPipeline exposing (Msg, view)
 import Regex exposing (HowMany(All), regex, replace)
 import RemoteData
 import Routes
+import ScreenSize
+import SearchBar exposing (SearchBar(..))
 import Simple.Fuzzy exposing (filter, match, root)
 import Task
 import Time exposing (Time)
+import UserState
+import Window
 
 
 type alias Ports =
@@ -40,24 +66,10 @@ type alias Ports =
     }
 
 
-type alias PinTeamConfig =
-    { pageHeaderClass : String
-    , pageBodyClass : String
-    , sectionHeaderClass : String
-    , sectionClass : String
-    , sectionBodyClass : String
-    }
-
-
-port pinTeamNames : PinTeamConfig -> Cmd msg
-
-
 port tooltip : ( String, String ) -> Cmd msg
 
 
-
--- TODO all the crsfToken stuff in this file only gets actually used for ordering and toggling pipelines.
--- honestly it seems like it could live in a completely different module.
+port tooltipHd : ( String, String ) -> Cmd msg
 
 
 type alias Flags =
@@ -65,27 +77,81 @@ type alias Flags =
     , turbulencePath : String
     , search : String
     , highDensity : Bool
+    , pipelineRunningKeyframes : String
     }
 
 
 type DashboardError
     = NotAsked
     | Turbulence String
-    | NoPipelines
 
 
 type alias Model =
     { csrfToken : String
     , state : Result DashboardError SubState.SubState
-    , topBar : NewTopBar.Model
-    , turbulencePath : String -- this doesn't vary, it's more a prop (in the sense of react) than state. should be a way to use a thunk for the Turbulence case of DashboardState
+    , turbulencePath : String
     , highDensity : Bool
+    , hoveredPipeline : Maybe Models.Pipeline
+    , pipelineRunningKeyframes : String
+    , groups : List Group.Group
+    , hoveredCliIcon : Maybe Cli.Cli
+    , hoveredTopCliIcon : Maybe Cli.Cli
+    , screenSize : ScreenSize.ScreenSize
+    , version : String
+    , userState : UserState.UserState
+    , userMenuVisible : Bool
+    , searchBar : SearchBar
+    , hideFooter : Bool
+    , hideFooterCounter : Int
+    , showHelp : Bool
     }
 
 
-stateLens : Monocle.Lens.Lens Model (Result DashboardError SubState.SubState)
-stateLens =
-    Monocle.Lens.Lens .state (\b a -> { a | state = b })
+type Effect
+    = FetchData
+    | FocusSearchInput
+    | ModifyUrl String
+    | NewUrl String
+    | SendTogglePipelineRequest { pipeline : Models.Pipeline, csrfToken : Concourse.CSRFToken }
+    | ShowTooltip ( String, String )
+    | ShowTooltipHd ( String, String )
+    | SendOrderPipelinesRequest String (List Models.Pipeline) Concourse.CSRFToken
+    | RedirectToLogin String
+    | SendLogOutRequest
+
+
+toCmd : Effect -> Cmd Msg
+toCmd effect =
+    case effect of
+        FetchData ->
+            fetchData
+
+        FocusSearchInput ->
+            Task.attempt (always Noop) (Dom.focus "search-input-field")
+
+        ModifyUrl url ->
+            Navigation.modifyUrl url
+
+        NewUrl url ->
+            Navigation.newUrl url
+
+        SendTogglePipelineRequest { pipeline, csrfToken } ->
+            togglePipelinePaused { pipeline = pipeline, csrfToken = csrfToken }
+
+        ShowTooltip ( teamName, pipelineName ) ->
+            tooltip ( teamName, pipelineName )
+
+        ShowTooltipHd ( teamName, pipelineName ) ->
+            tooltipHd ( teamName, pipelineName )
+
+        SendOrderPipelinesRequest teamName pipelines csrfToken ->
+            orderPipelines teamName pipelines csrfToken
+
+        RedirectToLogin s ->
+            LoginRedirect.requestLoginRedirect s
+
+        SendLogOutRequest ->
+            NewTopBar.logOut
 
 
 substateOptional : Monocle.Optional.Optional Model SubState.SubState
@@ -93,272 +159,540 @@ substateOptional =
     Monocle.Optional.Optional (.state >> Result.toMaybe) (\s m -> { m | state = Ok s })
 
 
-type Msg
-    = Noop
-    | APIDataFetched (RemoteData.WebData ( Time.Time, ( Group.APIData, Maybe Concourse.User ) ))
-    | ClockTick Time.Time
-    | AutoRefresh Time
-    | ShowFooter
-    | KeyPressed Keyboard.KeyCode
-    | KeyDowns Keyboard.KeyCode
-    | TopBarMsg NewTopBar.Msg
-    | PipelinePauseToggled Concourse.Pipeline (Result Http.Error ())
-    | PipelineMsg Pipeline.Msg
-    | GroupMsg Group.Msg
-
-
 init : Ports -> Flags -> ( Model, Cmd Msg )
 init ports flags =
     let
-        ( topBar, topBarMsg ) =
-            NewTopBar.init (not flags.highDensity) flags.search
+        searchBar =
+            Expanded
+                { query = flags.search
+                , selectionMade = False
+                , showAutocomplete = False
+                , selection = 0
+                }
     in
-        ( { state = Err NotAsked
-          , topBar = topBar
-          , csrfToken = flags.csrfToken
-          , turbulencePath = flags.turbulencePath
-          , highDensity = flags.highDensity
-          }
-        , Cmd.batch
-            [ fetchData
-            , Cmd.map TopBarMsg topBarMsg
-            , pinTeamNames
-                { pageHeaderClass = "module-topbar"
-                , pageBodyClass = "dashboard"
-                , sectionClass = "dashboard-team-group"
-                , sectionHeaderClass = "dashboard-team-header"
-                , sectionBodyClass = "dashboard-team-pipelines"
-                }
-            , ports.title <| "Dashboard" ++ " - "
-            ]
-        )
+    ( { state = Err NotAsked
+      , csrfToken = flags.csrfToken
+      , turbulencePath = flags.turbulencePath
+      , highDensity = flags.highDensity
+      , hoveredPipeline = Nothing
+      , pipelineRunningKeyframes = flags.pipelineRunningKeyframes
+      , groups = []
+      , hoveredCliIcon = Nothing
+      , hoveredTopCliIcon = Nothing
+      , screenSize = ScreenSize.Desktop
+      , version = ""
+      , userState = UserState.UserStateUnknown
+      , userMenuVisible = False
+      , hideFooter = False
+      , hideFooterCounter = 0
+      , showHelp = False
+      , searchBar = searchBar
+      }
+    , Cmd.batch
+        [ fetchData
+        , Group.pinTeamNames Group.stickyHeaderConfig
+        , ports.title <| "Dashboard" ++ " - "
+        , Task.perform ScreenResized Window.size
+        ]
+    )
 
 
-handle : a -> a -> Result e v -> a
-handle onError onSuccess result =
-    case result of
-        Ok _ ->
-            onSuccess
-
-        Err _ ->
-            onError
-
-
-substateLens : Monocle.Lens.Lens Model (Maybe SubState.SubState)
-substateLens =
-    Monocle.Lens.Lens (.state >> Result.toMaybe)
-        (\mss model -> Maybe.map (\ss -> { model | state = Ok ss }) mss |> Maybe.withDefault model)
-
-
-noop : Model -> ( Model, Cmd msg )
-noop model =
-    ( model, Cmd.none )
-
-
-substate : String -> Bool -> ( Time.Time, ( Group.APIData, Maybe Concourse.User ) ) -> Result DashboardError SubState.SubState
-substate csrfToken highDensity ( now, ( apiData, user ) ) =
-    apiData.pipelines
-        |> List.head
-        |> Maybe.map
-            (always
-                { teamData = SubState.teamData apiData user
-                , details =
-                    if highDensity then
-                        Nothing
-                    else
-                        Just
-                            { now = now
-                            , dragState = Group.NotDragging
-                            , dropState = Group.NotDropping
-                            , showHelp = False
-                            }
-                , hideFooter = False
-                , hideFooterCounter = 0
-                , csrfToken = csrfToken
-                }
-            )
-        |> Result.fromMaybe (NoPipelines)
-
-
-update : Msg -> Model -> ( Model, Cmd Msg )
+update : Msg -> Model -> ( Model, List Effect )
 update msg model =
-    let
-        reload =
-            Cmd.batch <|
-                handle [] [ fetchData ] model.state
-                    ++ [ Cmd.map TopBarMsg NewTopBar.fetchUser ]
-    in
-        case msg of
-            Noop ->
-                ( model, Cmd.none )
+    case msg of
+        Noop ->
+            ( model, [] )
 
-            APIDataFetched remoteData ->
-                (case remoteData of
-                    RemoteData.NotAsked ->
-                        model |> stateLens.set (Err NotAsked)
+        APIDataFetched remoteData ->
+            case remoteData of
+                RemoteData.NotAsked ->
+                    ( { model | state = Err NotAsked }, [] )
 
-                    RemoteData.Loading ->
-                        model |> stateLens.set (Err NotAsked)
+                RemoteData.Loading ->
+                    ( { model | state = Err NotAsked }, [] )
 
-                    RemoteData.Failure _ ->
-                        model |> stateLens.set (Err (Turbulence model.turbulencePath))
-
-                    RemoteData.Success ( now, ( apiData, user ) ) ->
-                        model
-                            |> Monocle.Lens.modify stateLens
-                                (Result.map
-                                    (.set SubState.teamDataLens (SubState.teamData apiData user)
-                                        >> .set (SubState.detailsOptional =|> Details.nowLens) now
-                                        >> Ok
-                                    )
-                                    >> Result.withDefault (substate model.csrfToken model.highDensity ( now, ( apiData, user ) ))
-                                )
-                )
-                    |> noop
-
-            ClockTick now ->
-                model
-                    |> Monocle.Optional.modify substateOptional (SubState.tick now)
-                    |> noop
-
-            AutoRefresh _ ->
-                ( model
-                , reload
-                )
-
-            KeyPressed keycode ->
-                handleKeyPressed (Char.fromCode keycode) model
-
-            KeyDowns keycode ->
-                update (TopBarMsg (NewTopBar.KeyDown keycode)) model
-
-            ShowFooter ->
-                model
-                    |> Monocle.Optional.modify substateOptional SubState.showFooter
-                    |> noop
-
-            -- TODO pull the topbar logic right in here. right now there are wasted API calls and this crufty
-            -- nonsense going on. however, this feels like a big change and not a big burning fire
-            TopBarMsg msg ->
-                let
-                    ( newTopBar, newTopBarMsg ) =
-                        NewTopBar.update msg model.topBar
-
-                    newMsg =
-                        case msg of
-                            NewTopBar.LoggedOut (Ok _) ->
-                                reload
-
-                            _ ->
-                                Cmd.map TopBarMsg newTopBarMsg
-                in
-                    ( { model | topBar = newTopBar }, newMsg )
-
-            PipelineMsg (Pipeline.TogglePipelinePaused pipeline) ->
-                ( model, togglePipelinePaused pipeline model.csrfToken )
-
-            PipelinePauseToggled pipeline (Ok ()) ->
-                let
-                    togglePipelinePause : List Concourse.Pipeline -> List Concourse.Pipeline
-                    togglePipelinePause pipelines =
-                        List.Extra.updateIf
-                            ((==) pipeline)
-                            -- TODO this lambda could be a utility/helper in the Concourse module
-                            (\pipeline -> { pipeline | paused = not pipeline.paused })
-                            pipelines
-                in
-                    ( model
-                    , Cmd.none
+                RemoteData.Failure _ ->
+                    ( { model | state = Err (Turbulence model.turbulencePath) }
+                    , []
                     )
 
-            PipelinePauseToggled _ (Err _) ->
-                ( model, Cmd.none )
+                RemoteData.Success ( now, apiData ) ->
+                    let
+                        groups =
+                            Group.groups apiData
 
-            GroupMsg (Group.DragStart teamName index) ->
-                model
-                    |> Monocle.Optional.modify
-                        (substateOptional => SubState.detailsOptional)
-                        ((Details.dragStateLens |> .set) <| Group.Dragging teamName index)
-                    |> noop
+                        noPipelines =
+                            List.isEmpty <| List.concatMap .pipelines groups
 
-            GroupMsg (Group.DragOver teamName index) ->
-                model
-                    |> Monocle.Optional.modify
-                        (substateOptional => SubState.detailsOptional)
-                        ((Details.dropStateLens |> .set) <| Group.Dropping index)
-                    |> noop
+                        newModel =
+                            case model.state of
+                                Ok substate ->
+                                    { model
+                                        | state =
+                                            Ok (SubState.tick now substate)
+                                    }
 
-            GroupMsg (Group.PipelineMsg msg) ->
-                flip update model <| PipelineMsg msg
+                                _ ->
+                                    { model
+                                        | state =
+                                            Ok
+                                                { now = now
+                                                , dragState = Group.NotDragging
+                                                , dropState = Group.NotDropping
+                                                }
+                                    }
 
-            PipelineMsg (Pipeline.TooltipHd pipelineName teamName) ->
-                ( model, DashboardHd.tooltipHd ( pipelineName, teamName ) )
+                        userState =
+                            case apiData.user of
+                                Just u ->
+                                    UserState.UserStateLoggedIn u
 
-            PipelineMsg (Pipeline.Tooltip pipelineName teamName) ->
-                ( model, tooltip ( pipelineName, teamName ) )
-
-            GroupMsg Group.DragEnd ->
-                let
-                    updatePipelines : ( Group.PipelineIndex, Group.PipelineIndex ) -> Group.Group -> ( Group.Group, Cmd Msg )
-                    updatePipelines ( dragIndex, dropIndex ) group =
-                        let
-                            newGroup =
-                                Group.shiftPipelines dragIndex dropIndex group
-                        in
-                            ( newGroup, orderPipelines newGroup.teamName newGroup.pipelines model.csrfToken )
-
-                    dragDropOptional : Monocle.Optional.Optional Model ( Group.DragState, Group.DropState )
-                    dragDropOptional =
-                        substateOptional
-                            => SubState.detailsOptional
-                            =|> Monocle.Lens.tuple (Details.dragStateLens) (Details.dropStateLens)
-
-                    dragDropIndexOptional : Monocle.Optional.Optional Model ( Group.PipelineIndex, Group.PipelineIndex )
-                    dragDropIndexOptional =
-                        dragDropOptional
-                            => Monocle.Optional.zip
-                                Group.dragIndexOptional
-                                Group.dropIndexOptional
-
-                    groupOptional : Monocle.Optional.Optional Model Group.Group
-                    groupOptional =
-                        (substateOptional
-                            => SubState.detailsOptional
-                            =|> Details.dragStateLens
-                            => Group.teamNameOptional
+                                Nothing ->
+                                    UserState.UserStateLoggedOut
+                    in
+                    if model.highDensity && noPipelines then
+                        ( { newModel
+                            | highDensity = False
+                            , groups = groups
+                            , version = apiData.version
+                            , userState = userState
+                          }
+                        , [ ModifyUrl Routes.dashboardRoute ]
                         )
-                            >>= (\teamName ->
-                                    substateOptional
-                                        =|> SubState.teamDataLens
-                                        =|> SubState.apiDataLens
-                                        =|> Group.groupsLens
-                                        => Group.findGroupOptional teamName
+
+                    else
+                        ( { newModel
+                            | groups = groups
+                            , version = apiData.version
+                            , userState = userState
+                          }
+                        , []
+                        )
+
+        ClockTick now ->
+            ( let
+                newModel =
+                    Footer.tick model
+              in
+              case model.state of
+                Ok substate ->
+                    { newModel | state = Ok (SubState.tick now substate) }
+
+                _ ->
+                    newModel
+            , []
+            )
+
+        AutoRefresh _ ->
+            ( model
+            , [ FetchData ]
+            )
+
+        KeyPressed keycode ->
+            handleKeyPressed (Char.fromCode keycode) model
+
+        ShowFooter ->
+            ( Footer.showFooter model, [] )
+
+        TogglePipelinePaused pipeline ->
+            ( model
+            , [ SendTogglePipelineRequest
+                    { pipeline = pipeline, csrfToken = model.csrfToken }
+              ]
+            )
+
+        DragStart teamName index ->
+            let
+                newModel =
+                    case model.state of
+                        Ok substate ->
+                            { model
+                                | state =
+                                    Ok
+                                        { substate
+                                            | dragState =
+                                                Group.Dragging
+                                                    teamName
+                                                    index
+                                        }
+                            }
+
+                        _ ->
+                            model
+            in
+            ( newModel, [] )
+
+        DragOver teamName index ->
+            let
+                newModel =
+                    case model.state of
+                        Ok substate ->
+                            { model
+                                | state =
+                                    Ok
+                                        { substate
+                                            | dropState =
+                                                Group.Dropping index
+                                        }
+                            }
+
+                        _ ->
+                            model
+            in
+            ( newModel, [] )
+
+        TooltipHd pipelineName teamName ->
+            ( model, [ ShowTooltipHd ( pipelineName, teamName ) ] )
+
+        Tooltip pipelineName teamName ->
+            ( model, [ ShowTooltip ( pipelineName, teamName ) ] )
+
+        DragEnd ->
+            let
+                updatePipelines :
+                    ( Group.PipelineIndex, Group.PipelineIndex )
+                    -> Group.Group
+                    -> ( Group.Group, List Effect )
+                updatePipelines ( dragIndex, dropIndex ) group =
+                    let
+                        newGroup =
+                            Group.shiftPipelines dragIndex dropIndex group
+                    in
+                    ( newGroup
+                    , [ SendOrderPipelinesRequest
+                            newGroup.teamName
+                            newGroup.pipelines
+                            model.csrfToken
+                      ]
+                    )
+
+                dragDropOptional : Monocle.Optional.Optional Model ( Group.DragState, Group.DropState )
+                dragDropOptional =
+                    substateOptional
+                        =|> Monocle.Lens.tuple
+                                Details.dragStateLens
+                                Details.dropStateLens
+
+                dragDropIndexOptional : Monocle.Optional.Optional Model ( Group.PipelineIndex, Group.PipelineIndex )
+                dragDropIndexOptional =
+                    dragDropOptional
+                        => Monocle.Optional.zip
+                            Group.dragIndexOptional
+                            Group.dropIndexOptional
+
+                groupsLens : Monocle.Lens.Lens Model (List Group.Group)
+                groupsLens =
+                    Monocle.Lens.Lens .groups (\b a -> { a | groups = b })
+
+                groupOptional : Monocle.Optional.Optional Model Group.Group
+                groupOptional =
+                    (substateOptional
+                        =|> Details.dragStateLens
+                        => Group.teamNameOptional
+                    )
+                        >>= (\teamName ->
+                                groupsLens
+                                    <|= Group.findGroupOptional teamName
+                            )
+
+                bigOptional : Monocle.Optional.Optional Model ( ( Group.PipelineIndex, Group.PipelineIndex ), Group.Group )
+                bigOptional =
+                    Monocle.Optional.tuple
+                        dragDropIndexOptional
+                        groupOptional
+            in
+            model
+                |> modifyWithEffect bigOptional
+                    (\( t, g ) ->
+                        let
+                            ( newG, msg ) =
+                                updatePipelines t g
+                        in
+                        ( ( t, newG ), msg )
+                    )
+                |> Tuple.mapFirst (dragDropOptional.set ( Group.NotDragging, Group.NotDropping ))
+
+        PipelineButtonHover state ->
+            ( { model | hoveredPipeline = state }, [] )
+
+        CliHover state ->
+            ( { model | hoveredCliIcon = state }, [] )
+
+        TopCliHover state ->
+            ( { model | hoveredTopCliIcon = state }, [] )
+
+        FilterMsg query ->
+            let
+                newModel =
+                    case model.searchBar of
+                        Expanded r ->
+                            { model | searchBar = Expanded { r | query = query } }
+
+                        _ ->
+                            model
+            in
+            ( newModel
+            , [ FocusSearchInput, ModifyUrl (NewTopBar.queryStringFromSearch query) ]
+            )
+
+        LogIn ->
+            ( model, [ RedirectToLogin "" ] )
+
+        LogOut ->
+            ( { model | state = Err NotAsked }, [ SendLogOutRequest ] )
+
+        LoggedOut (Ok ()) ->
+            let
+                redirectUrl =
+                    if model.highDensity then
+                        Routes.dashboardHdRoute
+
+                    else
+                        Routes.dashboardRoute
+            in
+            ( { model
+                | userState = UserState.UserStateLoggedOut
+                , userMenuVisible = False
+              }
+            , [ NewUrl redirectUrl, FetchData ]
+            )
+
+        LoggedOut (Err err) ->
+            flip always (Debug.log "failed to log out" err) <|
+                ( model, [] )
+
+        ToggleUserMenu ->
+            ( { model | userMenuVisible = not model.userMenuVisible }, [] )
+
+        FocusMsg ->
+            let
+                newModel =
+                    case model.searchBar of
+                        Expanded r ->
+                            { model
+                                | searchBar =
+                                    Expanded
+                                        { r
+                                            | showAutocomplete = True
+                                        }
+                            }
+
+                        _ ->
+                            model
+            in
+            ( newModel, [] )
+
+        BlurMsg ->
+            let
+                newModel =
+                    case model.searchBar of
+                        Expanded r ->
+                            case model.screenSize of
+                                ScreenSize.Mobile ->
+                                    if String.isEmpty r.query then
+                                        { model | searchBar = Collapsed }
+
+                                    else
+                                        { model
+                                            | searchBar =
+                                                Expanded
+                                                    { r
+                                                        | showAutocomplete = False
+                                                        , selectionMade = False
+                                                        , selection = 0
+                                                    }
+                                        }
+
+                                ScreenSize.Desktop ->
+                                    { model
+                                        | searchBar =
+                                            Expanded
+                                                { r
+                                                    | showAutocomplete = False
+                                                    , selectionMade = False
+                                                    , selection = 0
+                                                }
+                                    }
+
+                                ScreenSize.BigDesktop ->
+                                    { model
+                                        | searchBar =
+                                            Expanded
+                                                { r
+                                                    | showAutocomplete = False
+                                                    , selectionMade = False
+                                                    , selection = 0
+                                                }
+                                    }
+
+                        _ ->
+                            model
+            in
+            ( newModel, [] )
+
+        SelectMsg index ->
+            let
+                newModel =
+                    case model.searchBar of
+                        Expanded r ->
+                            { model
+                                | searchBar =
+                                    Expanded
+                                        { r
+                                            | selectionMade = True
+                                            , selection = index + 1
+                                        }
+                            }
+
+                        _ ->
+                            model
+            in
+            ( newModel, [] )
+
+        KeyDowns keycode ->
+            case model.searchBar of
+                Expanded r ->
+                    if not r.showAutocomplete then
+                        ( { model
+                            | searchBar =
+                                Expanded
+                                    { r
+                                        | selectionMade = False
+                                        , selection = 0
+                                    }
+                          }
+                        , []
+                        )
+
+                    else
+                        case keycode of
+                            -- enter key
+                            13 ->
+                                if not r.selectionMade then
+                                    ( model, [] )
+
+                                else
+                                    let
+                                        options =
+                                            Array.fromList
+                                                (NewTopBar.autocompleteOptions
+                                                    { query = r.query
+                                                    , groups = model.groups
+                                                    }
+                                                )
+
+                                        index =
+                                            (r.selection - 1) % Array.length options
+
+                                        selectedItem =
+                                            case Array.get index options of
+                                                Nothing ->
+                                                    r.query
+
+                                                Just item ->
+                                                    item
+                                    in
+                                    ( { model
+                                        | searchBar =
+                                            Expanded
+                                                { r
+                                                    | selectionMade = False
+                                                    , selection = 0
+                                                    , query = selectedItem
+                                                }
+                                      }
+                                    , []
+                                    )
+
+                            -- up arrow
+                            38 ->
+                                ( { model
+                                    | searchBar =
+                                        Expanded
+                                            { r
+                                                | selectionMade = True
+                                                , selection = r.selection - 1
+                                            }
+                                  }
+                                , []
                                 )
 
-                    bigOptional : Monocle.Optional.Optional Model ( ( Group.PipelineIndex, Group.PipelineIndex ), Group.Group )
-                    bigOptional =
-                        Monocle.Optional.tuple
-                            dragDropIndexOptional
-                            groupOptional
-                in
-                    model
-                        |> modifyWithEffect bigOptional
-                            (\( t, g ) ->
-                                let
-                                    ( newG, msg ) =
-                                        updatePipelines t g
-                                in
-                                    ( ( t, newG ), msg )
-                            )
-                        |> Tuple.mapFirst (dragDropOptional.set ( Group.NotDragging, Group.NotDropping ))
+                            -- down arrow
+                            40 ->
+                                ( { model
+                                    | searchBar =
+                                        Expanded
+                                            { r
+                                                | selectionMade = True
+                                                , selection = r.selection + 1
+                                            }
+                                  }
+                                , []
+                                )
+
+                            -- escape key
+                            27 ->
+                                ( model, [ FocusSearchInput ] )
+
+                            _ ->
+                                ( { model
+                                    | searchBar =
+                                        Expanded
+                                            { r
+                                                | selectionMade = False
+                                                , selection = 0
+                                            }
+                                  }
+                                , []
+                                )
+
+                _ ->
+                    ( model, [] )
+
+        ShowSearchInput ->
+            let
+                newModel =
+                    { model
+                        | searchBar =
+                            Expanded
+                                { query = ""
+                                , selectionMade = False
+                                , showAutocomplete = False
+                                , selection = 0
+                                }
+                    }
+            in
+            case model.searchBar of
+                Collapsed ->
+                    ( newModel, [ FocusSearchInput ] )
+
+                _ ->
+                    ( model, [] )
+
+        ScreenResized size ->
+            let
+                newSize =
+                    ScreenSize.fromWindowSize size
+            in
+            ( { model
+                | screenSize = newSize
+                , searchBar =
+                    SearchBar.screenSizeChanged
+                        { oldSize = model.screenSize
+                        , newSize = newSize
+                        }
+                        model.searchBar
+              }
+            , []
+            )
 
 
-orderPipelines : String -> List Pipeline.PipelineWithJobs -> Concourse.CSRFToken -> Cmd Msg
+orderPipelines : String -> List Models.Pipeline -> Concourse.CSRFToken -> Cmd Msg
 orderPipelines teamName pipelines csrfToken =
     Task.attempt (always Noop) <|
         Concourse.Pipeline.order
             teamName
-            (List.map (.name << .pipeline) <| pipelines)
+            (List.map .name pipelines)
             csrfToken
 
 
@@ -366,11 +700,12 @@ orderPipelines teamName pipelines csrfToken =
 -- TODO this seems obsessed with pipelines. shouldn't be the dashboard's business
 
 
-togglePipelinePaused : Concourse.Pipeline -> Concourse.CSRFToken -> Cmd Msg
-togglePipelinePaused pipeline csrfToken =
-    Task.attempt (PipelinePauseToggled pipeline) <|
-        if pipeline.paused then
+togglePipelinePaused : { pipeline : Models.Pipeline, csrfToken : Concourse.CSRFToken } -> Cmd Msg
+togglePipelinePaused { pipeline, csrfToken } =
+    Task.attempt (always Noop) <|
+        if pipeline.status == PipelineStatus.PipelineStatusPaused then
             Concourse.Pipeline.unpause pipeline.teamName pipeline.name csrfToken
+
         else
             Concourse.Pipeline.pause pipeline.teamName pipeline.name csrfToken
 
@@ -384,13 +719,17 @@ subscriptions model =
         , Mouse.clicks (\_ -> ShowFooter)
         , Keyboard.presses KeyPressed
         , Keyboard.downs KeyDowns
+        , Window.resizes Msgs.ScreenResized
         ]
 
 
 view : Model -> Html Msg
 view model =
-    Html.div [ class "page" ]
-        [ (Html.map TopBarMsg << Html.fromUnstyled) (NewTopBar.view model.topBar)
+    Html.div
+        [ class "page"
+        , style [ ( "-webkit-font-smoothing", "antialiased" ) ]
+        ]
+        [ NewTopBar.view model
         , dashboardView model
         ]
 
@@ -406,15 +745,129 @@ dashboardView model =
                 Err (Turbulence path) ->
                     [ turbulenceView path ]
 
-                Err NoPipelines ->
-                    [ Html.div [ class "dashboard-no-content", css [ Css.height (Css.pct 100) ] ] [ (Html.map (always Noop) << Html.fromUnstyled) NoPipeline.view ] ]
-
                 Ok substate ->
-                    [ Html.div [ class "dashboard-content" ] (pipelinesView substate model.topBar.query ++ [ footerView substate ]) ]
+                    [ Html.div
+                        [ class "dashboard-content" ]
+                      <|
+                        welcomeCard model
+                            ++ pipelinesView
+                                { groups = model.groups
+                                , substate = substate
+                                , query = NewTopBar.query model
+                                , hoveredPipeline = model.hoveredPipeline
+                                , pipelineRunningKeyframes =
+                                    model.pipelineRunningKeyframes
+                                , userState = model.userState
+                                , highDensity = model.highDensity
+                                }
+                    ]
+                        ++ (List.map Html.fromUnstyled <| Footer.view model)
     in
-        Html.div
-            [ classList [ ( "dashboard", True ), ( "dashboard-hd", model.highDensity ) ] ]
-            mainContent
+    Html.div
+        [ classList
+            [ ( .pageBodyClass Group.stickyHeaderConfig, True )
+            , ( "dashboard-hd", model.highDensity )
+            ]
+        ]
+        mainContent
+
+
+welcomeCard :
+    { a
+        | hoveredTopCliIcon : Maybe Cli.Cli
+        , groups : List Group.Group
+        , userState : UserState.UserState
+    }
+    -> List (Html Msg)
+welcomeCard { hoveredTopCliIcon, groups, userState } =
+    let
+        noPipelines =
+            List.isEmpty (groups |> List.concatMap .pipelines)
+
+        cliIcon : Cli.Cli -> Maybe Cli.Cli -> Html Msg
+        cliIcon cli hoveredTopCliIcon =
+            let
+                ( cliName, ariaText, icon ) =
+                    case cli of
+                        Cli.OSX ->
+                            ( "osx", "OS X", "apple" )
+
+                        Cli.Windows ->
+                            ( "windows", "Windows", "windows" )
+
+                        Cli.Linux ->
+                            ( "linux", "Linux", "linux" )
+            in
+            Html.a
+                [ href (Cli.downloadUrl "amd64" cliName)
+                , attribute "aria-label" <| "Download " ++ ariaText ++ " CLI"
+                , style <|
+                    Styles.topCliIcon
+                        { hovered = hoveredTopCliIcon == Just cli
+                        , image = icon ++ "_logo.svg"
+                        }
+                , id <| "top-cli-" ++ cliName
+                , onMouseEnter <| TopCliHover <| Just cli
+                , onMouseLeave <| TopCliHover Nothing
+                ]
+                []
+    in
+    if noPipelines then
+        [ Html.div
+            [ id "welcome-card"
+            , style Styles.welcomeCard
+            ]
+            [ Html.div
+                [ style Styles.welcomeCardTitle ]
+                [ Html.text Text.welcome ]
+            , Html.div
+                [ style Styles.welcomeCardBody ]
+              <|
+                [ Html.div
+                    [ style
+                        [ ( "display", "flex" )
+                        , ( "align-items", "center" )
+                        ]
+                    ]
+                    [ Html.div
+                        [ style [ ( "margin-right", "10px" ) ] ]
+                        [ Html.text Text.cliInstructions ]
+                    , cliIcon Cli.OSX hoveredTopCliIcon
+                    , cliIcon Cli.Windows hoveredTopCliIcon
+                    , cliIcon Cli.Linux hoveredTopCliIcon
+                    ]
+                , Html.div
+                    []
+                    [ Html.text Text.setPipelineInstructions ]
+                ]
+                    ++ loginInstruction userState
+            , Html.pre [ style Styles.asciiArt ] [ Html.text Text.asciiArt ]
+            ]
+        ]
+
+    else
+        []
+
+
+loginInstruction : UserState.UserState -> List (Html Msg)
+loginInstruction userState =
+    case userState of
+        UserState.UserStateLoggedIn _ ->
+            []
+
+        _ ->
+            [ Html.div
+                [ id "login-instruction"
+                , style [ ( "line-height", "42px" ) ]
+                ]
+                [ Html.text "login "
+                , Html.a
+                    [ href "/login"
+                    , style [ ( "text-decoration", "underline" ) ]
+                    ]
+                    [ Html.text "here" ]
+                ]
+            ]
 
 
 noResultsView : String -> Html Msg
@@ -423,110 +876,52 @@ noResultsView query =
         boldedQuery =
             Html.span [ class "monospace-bold" ] [ Html.text query ]
     in
-        Html.div
-            [ class "dashboard" ]
-            [ Html.div [ class "dashboard-content " ]
-                [ Html.div
-                    [ class "dashboard-team-group" ]
-                    [ Html.div [ class "no-results" ]
-                        [ Html.text "No results for "
-                        , boldedQuery
-                        , Html.text " matched your search."
-                        ]
+    Html.div
+        [ class <| .pageBodyClass Group.stickyHeaderConfig ]
+        [ Html.div [ class "dashboard-content " ]
+            [ Html.div
+                [ class <| .sectionClass Group.stickyHeaderConfig ]
+                [ Html.div [ class "no-results" ]
+                    [ Html.text "No results for "
+                    , boldedQuery
+                    , Html.text " matched your search."
                     ]
                 ]
             ]
+        ]
 
 
-helpView : Details.Details -> Html Msg
-helpView details =
+helpView : { a | showHelp : Bool } -> Html Msg
+helpView { showHelp } =
     Html.div
         [ classList
             [ ( "keyboard-help", True )
-            , ( "hidden", not details.showHelp )
+            , ( "hidden", not showHelp )
             ]
         ]
-        [ Html.div [ class "help-title" ] [ Html.text "keyboard shortcuts" ]
-        , Html.div [ class "help-line" ] [ Html.div [ class "keys" ] [ Html.span [ class "key" ] [ Html.text "/" ] ], Html.text "search" ]
-        , Html.div [ class "help-line" ] [ Html.div [ class "keys" ] [ Html.span [ class "key" ] [ Html.text "?" ] ], Html.text "hide/show help" ]
-        ]
-
-
-toggleView : Bool -> Html Msg
-toggleView highDensity =
-    let
-        hdClass =
-            if highDensity then
-                "hd-on"
-            else
-                "hd-off"
-
-        route =
-            if highDensity then
-                Routes.dashboardRoute
-            else
-                Routes.dashboardHdRoute
-    in
-        Html.a [ class "toggle-high-density", href route, attribute "aria-label" "Toggle high-density view" ]
-            [ Html.div [ class <| "dashboard-pipeline-icon " ++ hdClass ] [], Html.text "high-density" ]
-
-
-footerView : SubState.SubState -> Html Msg
-footerView substate =
-    let
-        showHelp =
-            substate.details |> Maybe.map .showHelp |> Maybe.withDefault False
-    in
-        Html.div [] <|
+        [ Html.div
+            [ class "help-title" ]
+            [ Html.text "keyboard shortcuts" ]
+        , Html.div
+            [ class "help-line" ]
             [ Html.div
-                [ if substate.hideFooter || showHelp then
-                    class "dashboard-footer hidden"
-                  else
-                    class "dashboard-footer"
+                [ class "keys" ]
+                [ Html.span
+                    [ class "key" ]
+                    [ Html.text "/" ]
                 ]
-                [ Html.div [ class "dashboard-legend" ]
-                    [ Html.div [ class "dashboard-status-pending" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "pending" ]
-                    , Html.div [ class "dashboard-paused" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "paused" ]
-                    , Html.div [ class "dashboard-running" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "running" ]
-                    , Html.div [ class "dashboard-status-failed" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "failing" ]
-                    , Html.div [ class "dashboard-status-errored" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "errored" ]
-                    , Html.div [ class "dashboard-status-aborted" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "aborted" ]
-                    , Html.div [ class "dashboard-status-succeeded" ]
-                        [ Html.div [ class "dashboard-pipeline-icon" ] [], Html.text "succeeded" ]
-                    , Html.div [ class "dashboard-status-separator" ] [ Html.text "|" ]
-                    , Html.div [ class "dashboard-high-density" ] [ substate.details |> Maybe.Extra.isJust |> not |> toggleView ]
-                    ]
-                , Html.div [ class "concourse-info" ]
-                    [ Html.div [ class "concourse-version" ]
-                        [ Html.text "version: v", substate.teamData |> SubState.apiData |> .version |> Html.text ]
-                    , Html.div [ class "concourse-cli" ]
-                        [ Html.text "cli: "
-                        , Html.a [ href (Concourse.Cli.downloadUrl "amd64" "darwin"), attribute "aria-label" "Download OS X CLI" ]
-                            [ Html.i [ class "fa fa-apple" ] [] ]
-                        , Html.a [ href (Concourse.Cli.downloadUrl "amd64" "windows"), attribute "aria-label" "Download Windows CLI" ]
-                            [ Html.i [ class "fa fa-windows" ] [] ]
-                        , Html.a [ href (Concourse.Cli.downloadUrl "amd64" "linux"), attribute "aria-label" "Download Linux CLI" ]
-                            [ Html.i [ class "fa fa-linux" ] [] ]
-                        ]
-                    ]
-                ]
-            , Html.div
-                [ classList
-                    [ ( "keyboard-help", True )
-                    , ( "hidden", not showHelp )
-                    ]
-                ]
-                [ Html.div [ class "help-title" ] [ Html.text "keyboard shortcuts" ]
-                , Html.div [ class "help-line" ] [ Html.div [ class "keys" ] [ Html.span [ class "key" ] [ Html.text "/" ] ], Html.text "search" ]
-                , Html.div [ class "help-line" ] [ Html.div [ class "keys" ] [ Html.span [ class "key" ] [ Html.text "?" ] ], Html.text "hide/show help" ]
-                ]
+            , Html.text "search"
             ]
+        , Html.div [ class "help-line" ]
+            [ Html.div
+                [ class "keys" ]
+                [ Html.span
+                    [ class "key" ]
+                    [ Html.text "?" ]
+                ]
+            , Html.text "hide/show help"
+            ]
+        ]
 
 
 turbulenceView : String -> Html Msg
@@ -541,78 +936,74 @@ turbulenceView path =
         ]
 
 
-pipelinesView : SubState.SubState -> String -> List (Html Msg)
-pipelinesView substate query =
+pipelinesView :
+    { groups : List Group.Group
+    , substate : SubState.SubState
+    , hoveredPipeline : Maybe Models.Pipeline
+    , pipelineRunningKeyframes : String
+    , query : String
+    , userState : UserState.UserState
+    , highDensity : Bool
+    }
+    -> List (Html Msg)
+pipelinesView { groups, substate, hoveredPipeline, pipelineRunningKeyframes, query, userState, highDensity } =
     let
         filteredGroups =
-            substate.teamData |> SubState.apiData |> Group.groups |> filter query
+            groups |> filter query |> List.sortWith Group.ordering
 
         groupsToDisplay =
             if List.all (String.startsWith "team:") (filterTerms query) then
                 filteredGroups
+
             else
                 filteredGroups |> List.filter (.pipelines >> List.isEmpty >> not)
 
-        highDensity =
-            substate.details |> Maybe.Extra.isJust |> not
-
         groupViews =
-            case substate.details of
-                Just details ->
-                    case substate.teamData of
-                        SubState.Unauthenticated _ ->
-                            List.map
-                                (\g -> Group.view (Group.headerView g) details.dragState details.dropState details.now g)
-                                groupsToDisplay
+            if highDensity then
+                groupsToDisplay
+                    |> List.map (Group.hdView pipelineRunningKeyframes)
 
-                        SubState.Authenticated { user } ->
-                            List.map
-                                (\g -> Group.view (GroupWithTag.headerView g) details.dragState details.dropState details.now g.group)
-                                (GroupWithTag.addTagsAndSort user groupsToDisplay)
-
-                Nothing ->
-                    case substate.teamData of
-                        SubState.Unauthenticated _ ->
-                            List.map
-                                (\g -> Group.hdView (Group.headerView g) g.teamName g.pipelines)
-                                groupsToDisplay
-
-                        SubState.Authenticated { user } ->
-                            List.map
-                                (\g -> Group.hdView (GroupWithTag.headerView g) g.group.teamName g.group.pipelines)
-                                (GroupWithTag.addTagsAndSort user groupsToDisplay)
+            else
+                groupsToDisplay
+                    |> List.map
+                        (Group.view
+                            { dragState = substate.dragState
+                            , dropState = substate.dropState
+                            , now = substate.now
+                            , hoveredPipeline = hoveredPipeline
+                            , pipelineRunningKeyframes = pipelineRunningKeyframes
+                            }
+                        )
     in
-        if List.isEmpty groupViews then
-            [ noResultsView (toString query) ]
-        else
-            List.map (Html.map GroupMsg << Html.fromUnstyled) groupViews
+    if List.isEmpty groupViews && (not <| String.isEmpty query) then
+        [ noResultsView (toString query) ]
+
+    else
+        List.map Html.fromUnstyled groupViews
 
 
-handleKeyPressed : Char -> Model -> ( Model, Cmd Msg )
+handleKeyPressed : Char -> Footer.Model r -> ( Footer.Model r, List Effect )
 handleKeyPressed key model =
     case key of
         '/' ->
-            ( model, Task.attempt (always Noop) (Dom.focus "search-input-field") )
+            ( model, [ FocusSearchInput ] )
 
         '?' ->
-            model
-                |> Monocle.Optional.modify (substateOptional => SubState.detailsOptional) Details.toggleHelp
-                |> noop
+            ( Footer.toggleHelp model, [] )
 
         _ ->
-            update ShowFooter model
+            ( Footer.showFooter model, [] )
 
 
 fetchData : Cmd Msg
 fetchData =
-    Group.remoteData
-        |> Task.andThen remoteUser
+    APIData.remoteData
         |> Task.map2 (,) Time.now
         |> RemoteData.asCmd
         |> Cmd.map APIDataFetched
 
 
-remoteUser : Group.APIData -> Task.Task Http.Error ( Group.APIData, Maybe Concourse.User )
+remoteUser : APIData.APIData -> Task.Task Http.Error ( APIData.APIData, Maybe Concourse.User )
 remoteUser d =
     Concourse.User.fetchUser
         |> Task.map ((,) d << Just)
@@ -646,19 +1037,21 @@ filterPipelinesByTerm term ({ pipelines } as group) =
         statusSearchTerm =
             if searchStatus then
                 String.dropLeft 7 term
+
             else
                 term
 
         filterByStatus =
-            fuzzySearch (Pipeline.pipelineStatus >> Concourse.PipelineStatus.show) statusSearchTerm pipelines
+            fuzzySearch (.status >> PipelineStatus.show) statusSearchTerm pipelines
     in
-        { group
-            | pipelines =
-                if searchStatus then
-                    filterByStatus
-                else
-                    fuzzySearch (.pipeline >> .name) term pipelines
-        }
+    { group
+        | pipelines =
+            if searchStatus then
+                filterByStatus
+
+            else
+                fuzzySearch .name term pipelines
+    }
 
 
 filterGroupsByTerm : String -> List Group.Group -> List Group.Group
@@ -670,13 +1063,15 @@ filterGroupsByTerm term groups =
         teamSearchTerm =
             if searchTeams then
                 String.dropLeft 5 term
+
             else
                 term
     in
-        if searchTeams then
-            fuzzySearch .teamName teamSearchTerm groups
-        else
-            groups |> List.map (filterPipelinesByTerm term)
+    if searchTeams then
+        fuzzySearch .teamName teamSearchTerm groups
+
+    else
+        groups |> List.map (filterPipelinesByTerm term)
 
 
 fuzzySearch : (a -> String) -> String -> List a -> List a
@@ -685,7 +1080,8 @@ fuzzySearch map needle records =
         negateSearch =
             String.startsWith "-" needle
     in
-        if negateSearch then
-            List.filter (not << Simple.Fuzzy.match needle << map) records
-        else
-            List.filter (Simple.Fuzzy.match needle << map) records
+    if negateSearch then
+        List.filter (not << Simple.Fuzzy.match needle << map) records
+
+    else
+        List.filter (Simple.Fuzzy.match needle << map) records

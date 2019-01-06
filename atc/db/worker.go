@@ -3,16 +3,28 @@ package db
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/concourse/concourse/atc"
+	"github.com/lib/pq"
+	uuid "github.com/nu7hatch/gouuid"
 )
 
 var (
-	ErrWorkerNotPresent         = errors.New("worker-not-present-in-db")
-	ErrCannotPruneRunningWorker = errors.New("worker-not-stalled-for-pruning")
+	ErrWorkerNotPresent         = errors.New("worker not present in db")
+	ErrCannotPruneRunningWorker = errors.New("worker not stalled for pruning")
 )
+
+type ContainerOwnerDisappearedError struct {
+	owner ContainerOwner
+}
+
+func (e ContainerOwnerDisappearedError) Error() string {
+	return fmt.Sprintf("container owner %T disappeared", e.owner)
+}
 
 type WorkerState string
 
@@ -38,6 +50,7 @@ type Worker interface {
 	HTTPSProxyURL() string
 	NoProxy() string
 	ActiveContainers() int
+	ActiveVolumes() int
 	ResourceTypes() []atc.WorkerResourceType
 	Platform() string
 	Tags() []string
@@ -53,6 +66,9 @@ type Worker interface {
 	Retire() error
 	Prune() error
 	Delete() error
+
+	FindContainerOnWorker(owner ContainerOwner) (CreatingContainer, CreatedContainer, error)
+	CreateContainer(owner ContainerOwner, meta ContainerMetadata) (CreatingContainer, error)
 }
 
 type worker struct {
@@ -67,6 +83,7 @@ type worker struct {
 	httpsProxyURL    string
 	noProxy          string
 	activeContainers int
+	activeVolumes    int
 	resourceTypes    []atc.WorkerResourceType
 	platform         string
 	tags             []string
@@ -89,6 +106,7 @@ func (worker *worker) HTTPProxyURL() string                    { return worker.h
 func (worker *worker) HTTPSProxyURL() string                   { return worker.httpsProxyURL }
 func (worker *worker) NoProxy() string                         { return worker.noProxy }
 func (worker *worker) ActiveContainers() int                   { return worker.activeContainers }
+func (worker *worker) ActiveVolumes() int                      { return worker.activeVolumes }
 func (worker *worker) ResourceTypes() []atc.WorkerResourceType { return worker.resourceTypes }
 func (worker *worker) Platform() string                        { return worker.platform }
 func (worker *worker) Tags() []string                          { return worker.tags }
@@ -235,4 +253,102 @@ func (worker *worker) ResourceCerts() (*UsedWorkerResourceCerts, bool, error) {
 	}
 
 	return nil, false, nil
+}
+
+func (worker *worker) FindContainerOnWorker(owner ContainerOwner) (CreatingContainer, CreatedContainer, error) {
+	ownerQuery, found, err := owner.Find(worker.conn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !found {
+		return nil, nil, nil
+	}
+
+	return worker.findContainer(sq.And{
+		sq.Eq{"worker_name": worker.name},
+		ownerQuery,
+	})
+}
+
+func (worker *worker) CreateContainer(owner ContainerOwner, meta ContainerMetadata) (CreatingContainer, error) {
+	handle, err := uuid.NewV4()
+	if err != nil {
+		return nil, err
+	}
+
+	var containerID int
+	cols := []interface{}{&containerID}
+
+	metadata := &ContainerMetadata{}
+	cols = append(cols, metadata.ScanTargets()...)
+
+	tx, err := worker.conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	defer Rollback(tx)
+
+	insMap := meta.SQLMap()
+	insMap["worker_name"] = worker.name
+	insMap["handle"] = handle.String()
+
+	ownerCols, err := owner.Create(tx, worker.name)
+	if err != nil {
+		return nil, err
+	}
+
+	for k, v := range ownerCols {
+		insMap[k] = v
+	}
+
+	err = psql.Insert("containers").
+		SetMap(insMap).
+		Suffix("RETURNING id, " + strings.Join(containerMetadataColumns, ", ")).
+		RunWith(tx).
+		QueryRow().
+		Scan(cols...)
+	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code.Name() == pqFKeyViolationErrCode {
+			return nil, ContainerOwnerDisappearedError{owner}
+		}
+
+		return nil, err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return nil, err
+	}
+
+	return newCreatingContainer(
+		containerID,
+		handle.String(),
+		worker.name,
+		*metadata,
+		worker.conn,
+	), nil
+}
+
+func (worker *worker) findContainer(whereClause sq.Sqlizer) (CreatingContainer, CreatedContainer, error) {
+	creating, created, destroying, _, err := scanContainer(
+		selectContainers().
+			Where(whereClause).
+			RunWith(worker.conn).
+			QueryRow(),
+		worker.conn,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+
+	if destroying != nil {
+		return nil, nil, nil
+	}
+
+	return creating, created, nil
 }

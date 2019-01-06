@@ -2,10 +2,11 @@ package token
 
 import (
 	"errors"
-	"fmt"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/concourse/concourse/atc/api/accessor"
 	"github.com/concourse/concourse/atc/db"
 	"golang.org/x/oauth2"
 )
@@ -15,7 +16,7 @@ type Issuer interface {
 	Issue(*VerifiedClaims) (*oauth2.Token, error)
 }
 
-func NewIssuer(teamFactory db.TeamFactory, generator Generator, duration time.Duration) *issuer {
+func NewIssuer(teamFactory db.TeamFactory, generator Generator, duration time.Duration) Issuer {
 	return &issuer{
 		TeamFactory: teamFactory,
 		Generator:   generator,
@@ -29,16 +30,7 @@ type issuer struct {
 	Duration    time.Duration
 }
 
-func (self *issuer) Issue(verifiedClaims *VerifiedClaims) (*oauth2.Token, error) {
-
-	if self.TeamFactory == nil {
-		return nil, errors.New("Missing team factory")
-	}
-
-	if self.Generator == nil {
-		return nil, errors.New("Missing token generator")
-	}
-
+func (i *issuer) Issue(verifiedClaims *VerifiedClaims) (*oauth2.Token, error) {
 	if verifiedClaims.UserID == "" {
 		return nil, errors.New("Missing user id in verified claims")
 	}
@@ -47,7 +39,7 @@ func (self *issuer) Issue(verifiedClaims *VerifiedClaims) (*oauth2.Token, error)
 		return nil, errors.New("Missing connector id in verified claims")
 	}
 
-	dbTeams, err := self.TeamFactory.GetTeams()
+	dbTeams, err := i.TeamFactory.GetTeams()
 	if err != nil {
 		return nil, err
 	}
@@ -55,34 +47,37 @@ func (self *issuer) Issue(verifiedClaims *VerifiedClaims) (*oauth2.Token, error)
 	sub := verifiedClaims.Sub
 	email := verifiedClaims.Email
 	name := verifiedClaims.Name
-	userId := verifiedClaims.UserID
+	userID := verifiedClaims.UserID
 	userName := verifiedClaims.UserName
-	connectorId := verifiedClaims.ConnectorID
+	connectorID := verifiedClaims.ConnectorID
 	claimGroups := verifiedClaims.Groups
 
 	isAdmin := false
-	teamSet := map[string]bool{}
+	teamSet := map[string]map[string]bool{}
 
 	for _, team := range dbTeams {
+		teamSet[team.Name()] = map[string]bool{}
+
 		for role, auth := range team.Auth() {
 			userAuth := auth["users"]
 			groupAuth := auth["groups"]
 
-			teamRole := fmt.Sprintf("%s:%s", team.Name(), role)
-
+			// backwards compatibility for allow-all-users
 			if len(userAuth) == 0 && len(groupAuth) == 0 {
-				teamSet[teamRole] = true
-				isAdmin = isAdmin || team.Admin()
+				teamSet[team.Name()][role] = true
+				isAdmin = isAdmin || (team.Admin() && role == "owner")
 			}
 
 			for _, user := range userAuth {
-				if strings.EqualFold(user, connectorId+":"+userId) {
-					teamSet[teamRole] = true
-					isAdmin = isAdmin || team.Admin()
+				if strings.EqualFold(user, connectorID+":"+userID) {
+					teamSet[team.Name()][role] = true
+					isAdmin = isAdmin || (team.Admin() && role == "owner")
 				}
-				if strings.EqualFold(user, connectorId+":"+userName) {
-					teamSet[teamRole] = true
-					isAdmin = isAdmin || team.Admin()
+				if userName != "" {
+					if strings.EqualFold(user, connectorID+":"+userName) {
+						teamSet[team.Name()][role] = true
+						isAdmin = isAdmin || (team.Admin() && role == "owner")
+					}
 				}
 			}
 
@@ -93,15 +88,15 @@ func (self *issuer) Issue(verifiedClaims *VerifiedClaims) (*oauth2.Token, error)
 
 					if len(parts) > 0 {
 						// match the provider plus the org e.g. github:org-name
-						if strings.EqualFold(group, connectorId+":"+parts[0]) {
-							teamSet[teamRole] = true
-							isAdmin = isAdmin || team.Admin()
+						if strings.EqualFold(group, connectorID+":"+parts[0]) {
+							teamSet[team.Name()][role] = true
+							isAdmin = isAdmin || (team.Admin() && role == "owner")
 						}
 
 						// match the provider plus the entire claim group e.g. github:org-name:team-name
-						if strings.EqualFold(group, connectorId+":"+claimGroup) {
-							teamSet[teamRole] = true
-							isAdmin = isAdmin || team.Admin()
+						if strings.EqualFold(group, connectorID+":"+claimGroup) {
+							teamSet[team.Name()][role] = true
+							isAdmin = isAdmin || (team.Admin() && role == "owner")
 						}
 					}
 				}
@@ -109,20 +104,30 @@ func (self *issuer) Issue(verifiedClaims *VerifiedClaims) (*oauth2.Token, error)
 		}
 	}
 
-	teams := []string{}
-	for team, _ := range teamSet {
-		teams = append(teams, team)
+	teams := map[string][]string{}
+	for team, roles := range teamSet {
+		for role := range roles {
+			teams[team] = append(teams[team], role)
+		}
+		roleComparator := func(i, j int) bool {
+			return accessor.CompareRoles(teams[team][i], teams[team][j])
+		}
+		sort.Slice(teams[team], roleComparator)
 	}
 
-	return self.Generator.Generate(map[string]interface{}{
+	if len(teams) == 0 {
+		return nil, errors.New("user doesn't belong to any team")
+	}
+
+	return i.Generator.Generate(map[string]interface{}{
 		"sub":       sub,
 		"email":     email,
 		"name":      name,
-		"user_id":   userId,
+		"user_id":   userID,
 		"user_name": userName,
 		"teams":     teams,
 		"is_admin":  isAdmin,
-		"exp":       time.Now().Add(self.Duration).Unix(),
+		"exp":       time.Now().Add(i.Duration).Unix(),
 		"csrf":      RandomString(),
 	})
 }

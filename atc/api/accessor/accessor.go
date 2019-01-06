@@ -1,10 +1,9 @@
 package accessor
 
 import (
-	"strings"
-
 	"github.com/concourse/concourse/atc"
 	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/mitchellh/mapstructure"
 )
 
 //go:generate counterfeiter . Access
@@ -28,39 +27,33 @@ func (a *access) IsAuthenticated() bool {
 }
 
 func (a *access) IsAuthorized(team string) bool {
-	for _, teamRole := range a.TeamRoles() {
-
-		var teamName, roleName string
-
-		teamParts := strings.Split(teamRole, ":")
-
-		if len(teamParts) == 1 {
-			teamName = teamParts[0]
-			roleName = "owner"
-
-		} else if len(teamParts) > 1 {
-			teamName = strings.Join(teamParts[:len(teamParts)-1], ":")
-			roleName = teamParts[len(teamParts)-1]
-		}
-
+	for teamName, teamRoles := range a.TeamRoles() {
 		if teamName == team {
-			return a.HasPermission(roleName)
+			for _, teamRole := range teamRoles {
+				if a.HasPermission(teamRole) {
+					return true
+				}
+			}
 		}
 	}
 	return false
 }
 
-func (a *access) HasPermission(role string) bool {
-	switch requiredRoles[a.action] {
+func CompareRoles(role1, role2 string) bool {
+	switch role1 {
 	case "owner":
-		return role == "owner"
+		return true
 	case "member":
-		return role == "owner" || role == "member"
+		return role2 != "owner"
 	case "viewer":
-		return role == "owner" || role == "member" || role == "viewer"
+		return role2 == "viewer"
 	default:
 		return false
 	}
+}
+
+func (a *access) HasPermission(role string) bool {
+	return CompareRoles(role, requiredRoles[a.action])
 }
 
 func (a *access) IsAdmin() bool {
@@ -83,17 +76,21 @@ func (a *access) IsSystem() bool {
 	return false
 }
 
-func (a *access) TeamRoles() []string {
-	teamRoles := []string{}
+func (a *access) TeamRoles() map[string][]string {
+	teamRoles := map[string][]string{}
 
 	if claims, ok := a.Token.Claims.(jwt.MapClaims); ok {
 		if teamsClaim, ok := claims["teams"]; ok {
+
+			// support legacy token format with team names array
 			if teamsArr, ok := teamsClaim.([]interface{}); ok {
 				for _, teamObj := range teamsArr {
-					if teamRole, ok := teamObj.(string); ok {
-						teamRoles = append(teamRoles, teamRole)
+					if teamName, ok := teamObj.(string); ok {
+						teamRoles[teamName] = []string{"owner"}
 					}
 				}
+			} else {
+				_ = mapstructure.Decode(teamsClaim, &teamRoles)
 			}
 		}
 	}
@@ -102,17 +99,10 @@ func (a *access) TeamRoles() []string {
 }
 
 func (a *access) TeamNames() []string {
-	set := map[string]bool{}
-
-	for _, teamRole := range a.TeamRoles() {
-		if teamParts := strings.Split(teamRole, ":"); len(teamParts) > 0 {
-			set[teamParts[0]] = true
-		}
-	}
 
 	teams := []string{}
-	for team, _ := range set {
-		teams = append(teams, team)
+	for teamName := range a.TeamRoles() {
+		teams = append(teams, teamName)
 	}
 
 	return teams
@@ -159,6 +149,7 @@ var requiredRoles = map[string]string{
 	atc.GetResource:                   "viewer",
 	atc.PauseResource:                 "member",
 	atc.UnpauseResource:               "member",
+	atc.UnpinResource:                 "member",
 	atc.CheckResource:                 "member",
 	atc.CheckResourceWebHook:          "member",
 	atc.CheckResourceType:             "member",
@@ -166,6 +157,7 @@ var requiredRoles = map[string]string{
 	atc.GetResourceVersion:            "viewer",
 	atc.EnableResourceVersion:         "member",
 	atc.DisableResourceVersion:        "member",
+	atc.PinResourceVersion:            "member",
 	atc.ListBuildsWithVersionAsInput:  "viewer",
 	atc.ListBuildsWithVersionAsOutput: "viewer",
 	atc.GetResourceCausality:          "viewer",

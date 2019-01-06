@@ -2,23 +2,24 @@ port module SubPage exposing (Model(..), Msg(..), init, subscriptions, update, u
 
 import Autoscroll
 import Build
+import Build
 import Concourse
+import Dashboard
+import Dashboard.Msgs
+import FlySuccess
 import Html exposing (Html)
 import Html.Styled as HS
 import Http
 import Job
 import Json.Encode
-import Resource
-import Build
 import NotFound
 import Pipeline
 import QueryString
 import Resource
+import Resource
 import Routes
 import String
 import UpdateMsg exposing (UpdateMsg)
-import Dashboard
-import DashboardHd
 
 
 -- TODO: move ports somewhere else
@@ -38,7 +39,7 @@ type Model
     | PipelineModel Pipeline.Model
     | NotFoundModel NotFound.Model
     | DashboardModel Dashboard.Model
-    | DashboardHdModel DashboardHd.Model
+    | FlySuccessModel FlySuccess.Model
 
 
 type Msg
@@ -48,13 +49,15 @@ type Msg
     | PipelineMsg Pipeline.Msg
     | NewCSRFToken String
     | DashboardPipelinesFetched (Result Http.Error (List Concourse.Pipeline))
-    | DashboardMsg Dashboard.Msg
-    | DashboardHdMsg DashboardHd.Msg
+    | DashboardMsg Dashboard.Msgs.Msg
+    | FlySuccessMsg FlySuccess.Msg
 
 
 type alias Flags =
     { csrfToken : String
+    , authToken : String
     , turbulencePath : String
+    , pipelineRunningKeyframes : String
     }
 
 
@@ -145,6 +148,7 @@ init flags route =
                     , csrfToken = flags.csrfToken
                     , search = querySearchForRoute route
                     , highDensity = False
+                    , pipelineRunningKeyframes = flags.pipelineRunningKeyframes
                     }
 
         Routes.DashboardHd ->
@@ -155,6 +159,14 @@ init flags route =
                     , csrfToken = flags.csrfToken
                     , search = querySearchForRoute route
                     , highDensity = True
+                    , pipelineRunningKeyframes = flags.pipelineRunningKeyframes
+                    }
+
+        Routes.FlySuccess ->
+            superDupleWrap ( FlySuccessModel, FlySuccessMsg ) <|
+                FlySuccess.init
+                    { authToken = flags.authToken
+                    , flyPort = QueryString.one QueryString.int "fly_port" route.queries
                     }
 
 
@@ -210,13 +222,15 @@ update turbulence notFound csrfToken msg mdl =
             ( DashboardModel { model | csrfToken = c }, Cmd.none )
 
         ( DashboardMsg message, DashboardModel model ) ->
-            superDupleWrap ( DashboardModel, DashboardMsg ) <| Dashboard.update message model
+            Dashboard.update message model
+                |> Tuple.mapSecond (List.map Dashboard.toCmd >> Cmd.batch)
+                |> superDupleWrap ( DashboardModel, DashboardMsg )
+
+        ( FlySuccessMsg message, FlySuccessModel model ) ->
+            superDupleWrap ( FlySuccessModel, FlySuccessMsg ) <| FlySuccess.update message model
 
         ( NewCSRFToken _, _ ) ->
             ( mdl, Cmd.none )
-
-        ( DashboardHdMsg message, DashboardHdModel model ) ->
-            superDupleWrap ( DashboardHdModel, DashboardHdMsg ) <| DashboardHd.update message model
 
         unknown ->
             flip always (Debug.log ("impossible combination") unknown) <|
@@ -292,19 +306,19 @@ view mdl =
             Html.map PipelineMsg <| Pipeline.view model
 
         ResourceModel model ->
-            Html.map ResourceMsg <| Resource.view model
+            Html.map ResourceMsg <| (HS.toUnstyled << Resource.view) model
 
         DashboardModel model ->
             (Html.map DashboardMsg << HS.toUnstyled) <| Dashboard.view model
-
-        DashboardHdModel model ->
-            Html.map DashboardHdMsg <| DashboardHd.view model
 
         WaitingModel _ ->
             Html.div [] []
 
         NotFoundModel model ->
             NotFound.view model
+
+        FlySuccessModel model ->
+            Html.map FlySuccessMsg <| FlySuccess.view model
 
 
 subscriptions : Model -> Sub Msg
@@ -325,11 +339,11 @@ subscriptions mdl =
         DashboardModel model ->
             Sub.map DashboardMsg <| Dashboard.subscriptions model
 
-        DashboardHdModel model ->
-            Sub.map DashboardHdMsg <| DashboardHd.subscriptions model
-
         WaitingModel _ ->
             Sub.none
 
         NotFoundModel _ ->
+            Sub.none
+
+        FlySuccessModel _ ->
             Sub.none

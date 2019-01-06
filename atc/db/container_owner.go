@@ -2,6 +2,8 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
+	"time"
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/concourse/concourse/atc"
@@ -22,14 +24,17 @@ type ContainerOwner interface {
 // state, or disappears, the container can be removed.
 func NewImageCheckContainerOwner(
 	container CreatingContainer,
+	teamID int,
 ) ContainerOwner {
 	return imageCheckContainerOwner{
 		Container: container,
+		TeamID:    teamID,
 	}
 }
 
 type imageCheckContainerOwner struct {
 	Container CreatingContainer
+	TeamID    int
 }
 
 func (c imageCheckContainerOwner) Find(Conn) (sq.Eq, bool, error) {
@@ -43,6 +48,7 @@ func (c imageCheckContainerOwner) Create(Tx, string) (map[string]interface{}, er
 func (c imageCheckContainerOwner) sqlMap() map[string]interface{} {
 	return map[string]interface{}{
 		"image_check_container_id": c.Container.ID(),
+		"team_id":                  c.TeamID,
 	}
 }
 
@@ -51,14 +57,17 @@ func (c imageCheckContainerOwner) sqlMap() map[string]interface{} {
 // state, or disappears, the container can be removed.
 func NewImageGetContainerOwner(
 	container CreatingContainer,
+	teamID int,
 ) ContainerOwner {
 	return imageGetContainerOwner{
 		Container: container,
+		TeamID:    teamID,
 	}
 }
 
 type imageGetContainerOwner struct {
 	Container CreatingContainer
+	TeamID    int
 }
 
 func (c imageGetContainerOwner) Find(Conn) (sq.Eq, bool, error) {
@@ -72,6 +81,7 @@ func (c imageGetContainerOwner) Create(Tx, string) (map[string]interface{}, erro
 func (c imageGetContainerOwner) sqlMap() map[string]interface{} {
 	return map[string]interface{}{
 		"image_get_container_id": c.Container.ID(),
+		"team_id":                c.TeamID,
 	}
 }
 
@@ -80,16 +90,19 @@ func (c imageGetContainerOwner) sqlMap() map[string]interface{} {
 func NewBuildStepContainerOwner(
 	buildID int,
 	planID atc.PlanID,
+	teamID int,
 ) ContainerOwner {
 	return buildStepContainerOwner{
 		BuildID: buildID,
 		PlanID:  planID,
+		TeamID:  teamID,
 	}
 }
 
 type buildStepContainerOwner struct {
 	BuildID int
 	PlanID  atc.PlanID
+	TeamID  int
 }
 
 func (c buildStepContainerOwner) Find(Conn) (sq.Eq, bool, error) {
@@ -104,6 +117,7 @@ func (c buildStepContainerOwner) sqlMap() map[string]interface{} {
 	return map[string]interface{}{
 		"build_id": c.BuildID,
 		"plan_id":  c.PlanID,
+		"team_id":  c.TeamID,
 	}
 }
 
@@ -112,27 +126,33 @@ func (c buildStepContainerOwner) sqlMap() map[string]interface{} {
 // worker base resource type disappear, or the expiry is reached, the container
 // can be removed.
 func NewResourceConfigCheckSessionContainerOwner(
-	resourceConfigCheckSession ResourceConfigCheckSession,
-	teamID int,
+	resourceConfig ResourceConfig,
+	expiries ContainerOwnerExpiries,
 ) ContainerOwner {
 	return resourceConfigCheckSessionContainerOwner{
-		resourceConfigCheckSession: resourceConfigCheckSession,
-		teamID:                     teamID,
+		resourceConfig: resourceConfig,
+		expiries:       expiries,
 	}
 }
 
 type resourceConfigCheckSessionContainerOwner struct {
-	resourceConfigCheckSession ResourceConfigCheckSession
-	teamID                     int
+	resourceConfig ResourceConfig
+	expiries       ContainerOwnerExpiries
+}
+
+type ContainerOwnerExpiries struct {
+	GraceTime time.Duration
+	Min       time.Duration
+	Max       time.Duration
 }
 
 func (c resourceConfigCheckSessionContainerOwner) Find(conn Conn) (sq.Eq, bool, error) {
 	var id int
 	err := psql.Select("id").
-		From("worker_resource_config_check_sessions").
+		From("resource_config_check_sessions").
 		Where(sq.And{
-			sq.Eq{"resource_config_check_session_id": c.resourceConfigCheckSession.ID()},
-			sq.Eq{"team_id": c.teamID},
+			sq.Eq{"resource_config_id": c.resourceConfig.ID()},
+			sq.Expr(fmt.Sprintf("expires_at > NOW() + interval '%d seconds'", int(c.expiries.GraceTime.Seconds()))),
 		}).
 		RunWith(conn).
 		QueryRow().
@@ -146,7 +166,7 @@ func (c resourceConfigCheckSessionContainerOwner) Find(conn Conn) (sq.Eq, bool, 
 	}
 
 	return sq.Eq{
-		"worker_resource_config_check_session_id": id,
+		"resource_config_check_session_id": id,
 	}, true, nil
 }
 
@@ -156,7 +176,7 @@ func (c resourceConfigCheckSessionContainerOwner) Create(tx Tx, workerName strin
 		From("worker_base_resource_types").
 		Where(sq.Eq{
 			"worker_name":           workerName,
-			"base_resource_type_id": c.resourceConfigCheckSession.ResourceConfig().OriginBaseResourceType().ID,
+			"base_resource_type_id": c.resourceConfig.OriginBaseResourceType().ID,
 		}).
 		Suffix("FOR SHARE").
 		RunWith(tx).
@@ -166,28 +186,33 @@ func (c resourceConfigCheckSessionContainerOwner) Create(tx Tx, workerName strin
 		return nil, err
 	}
 
-	var wrccsID int
-	err = psql.Insert("worker_resource_config_check_sessions").
+	expiryStmt := fmt.Sprintf(
+		"NOW() + LEAST(GREATEST('%d seconds'::interval, NOW() - to_timestamp(max(start_time))), '%d seconds'::interval)",
+		int(c.expiries.Min.Seconds()),
+		int(c.expiries.Max.Seconds()),
+	)
+
+	var rccsID int
+	err = psql.Insert("resource_config_check_sessions").
 		SetMap(map[string]interface{}{
-			"resource_config_check_session_id": c.resourceConfigCheckSession.ID(),
-			"worker_base_resource_type_id":     wbrtID,
-			"team_id":                          c.teamID,
+			"resource_config_id":           c.resourceConfig.ID(),
+			"worker_base_resource_type_id": wbrtID,
+			"expires_at":                   sq.Expr("(SELECT " + expiryStmt + " FROM workers)"),
 		}).
 		Suffix(`
-			ON CONFLICT (resource_config_check_session_id, worker_base_resource_type_id, team_id) DO UPDATE SET
-				resource_config_check_session_id = ?,
-				worker_base_resource_type_id = ?,
-				team_id = ?
+			ON CONFLICT (resource_config_id, worker_base_resource_type_id) DO UPDATE SET
+				resource_config_id = ?,
+				worker_base_resource_type_id = ?
 			RETURNING id
-		`, c.resourceConfigCheckSession.ID(), wbrtID, c.teamID).
+		`, c.resourceConfig.ID(), wbrtID).
 		RunWith(tx).
 		QueryRow().
-		Scan(&wrccsID)
+		Scan(&rccsID)
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]interface{}{
-		"worker_resource_config_check_session_id": wrccsID,
+		"resource_config_check_session_id": rccsID,
 	}, nil
 }

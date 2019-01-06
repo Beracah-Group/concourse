@@ -64,7 +64,6 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 				})
 
 				Context("when the cache is for a saved image resource version for a finished build", func() {
-
 					setBuildStatus := func(a db.BuildStatus) {
 						resourceCache, build := resourceCacheForOneOffBuild()
 
@@ -129,7 +128,6 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 
 					Context("when the build has succeeded", func() {
 						It("does not remove the resource cache for the most recent build", func() {
-
 							setBuildStatus(db.BuildStatusSucceeded)
 							Expect(countResourceCaches()).To(Equal(1))
 
@@ -176,8 +174,7 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 
 			BeforeEach(func() {
 				var err error
-
-				resourceConfigCheckSession, err := resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
+				resourceConfig, err := resourceConfigFactory.FindOrCreateResourceConfig(
 					logger,
 					"some-base-resource-type",
 					atc.Source{
@@ -187,14 +184,12 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 						template.StaticVariables{"source-param": "some-secret-sauce"},
 						atc.VersionedResourceTypes{},
 					),
-					db.ContainerOwnerExpiries{},
 				)
-
 				Expect(err).ToNot(HaveOccurred())
 
-				containerOwner = db.NewResourceConfigCheckSessionContainerOwner(resourceConfigCheckSession, defaultTeam.ID())
+				containerOwner = db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, db.ContainerOwnerExpiries{})
 
-				container, err = defaultTeam.CreateContainer(defaultWorker.Name(), containerOwner, db.ContainerMetadata{})
+				container, err = defaultWorker.CreateContainer(containerOwner, db.ContainerMetadata{})
 				Expect(err).ToNot(HaveOccurred())
 
 				_ = createResourceCacheWithUser(db.ForContainer(container.ID()))
@@ -234,7 +229,7 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 
 		Context("when the cache is for a custom resource type", func() {
 			It("does not remove the cache if the type is still configured", func() {
-				_, err := resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
+				_, err := resourceConfigFactory.FindOrCreateResourceConfig(
 					logger,
 					"some-type",
 					atc.Source{
@@ -255,7 +250,6 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 							},
 						},
 					),
-					db.ContainerOwnerExpiries{},
 				)
 				Expect(err).ToNot(HaveOccurred())
 
@@ -267,7 +261,7 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 			})
 
 			It("removes the cache if the type is no longer configured", func() {
-				_, err := resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
+				_, err := resourceConfigFactory.FindOrCreateResourceConfig(
 					logger,
 					"some-type",
 					atc.Source{
@@ -288,7 +282,6 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 							},
 						},
 					),
-					db.ContainerOwnerExpiries{},
 				)
 				Expect(err).ToNot(HaveOccurred())
 
@@ -312,43 +305,34 @@ var _ = Describe("ResourceCacheLifecycle", func() {
 				err := defaultPipeline.Unpause()
 				Expect(err).ToNot(HaveOccurred())
 
-				resourceConfigCheckSession, err := resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
+				resourceConfig, err := defaultResource.SetResourceConfig(
 					logger,
-					"some-base-resource-type",
-					atc.Source{
-						"some": "source",
-					},
+					atc.Source{"some": "source"},
 					creds.NewVersionedResourceTypes(
 						template.StaticVariables{"source-param": "some-secret-sauce"},
 						atc.VersionedResourceTypes{},
 					),
-					db.ContainerOwnerExpiries{},
 				)
 				Expect(err).ToNot(HaveOccurred())
 
-				containerOwner := db.NewResourceConfigCheckSessionContainerOwner(resourceConfigCheckSession, defaultTeam.ID())
+				containerOwner := db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, db.ContainerOwnerExpiries{})
 
-				container, err := defaultTeam.CreateContainer(defaultWorker.Name(), containerOwner, db.ContainerMetadata{})
+				container, err := defaultWorker.CreateContainer(containerOwner, db.ContainerMetadata{})
 				Expect(err).ToNot(HaveOccurred())
 
 				rc := createResourceCacheWithUser(db.ForContainer(container.ID()))
 
-				err = defaultResource.SetResourceConfig(rc.ResourceConfig().ID())
+				err = rc.ResourceConfig().SaveVersions([]atc.Version{{"some": "version"}})
 				Expect(err).ToNot(HaveOccurred())
 
-				err = defaultPipeline.SaveResourceVersions(atc.ResourceConfig{
-					Name: defaultResource.Name(),
-					Type: defaultResource.Type(),
-				}, []atc.Version{{"some": "version"}})
-				Expect(err).ToNot(HaveOccurred())
-
-				versionedResource, found, err := defaultPipeline.GetVersionedResourceByVersion(atc.Version{"some": "version"}, defaultResource.Name())
+				resourceConfigVersion, found, err := rc.ResourceConfig().FindVersion(atc.Version{"some": "version"})
 				Expect(found).To(BeTrue())
 				Expect(err).ToNot(HaveOccurred())
 
 				err = defaultJob.SaveNextInputMapping(algorithm.InputMapping{
 					"some-resource": algorithm.InputVersion{
-						VersionID: versionedResource.ID,
+						VersionID:  resourceConfigVersion.ID(),
+						ResourceID: defaultResource.ID(),
 					},
 				})
 				Expect(err).ToNot(HaveOccurred())

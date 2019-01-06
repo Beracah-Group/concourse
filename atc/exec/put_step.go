@@ -27,17 +27,18 @@ type PutStep struct {
 
 	name         string
 	resourceType string
+	resource     string
 	source       creds.Source
 	params       creds.Params
 	tags         atc.Tags
+	inputs       PutInputs
 
-	resource string
-
-	delegate          PutDelegate
-	resourceFactory   resource.ResourceFactory
-	planID            atc.PlanID
-	containerMetadata db.ContainerMetadata
-	stepMetadata      StepMetadata
+	delegate              PutDelegate
+	resourceFactory       resource.ResourceFactory
+	resourceConfigFactory db.ResourceConfigFactory
+	planID                atc.PlanID
+	containerMetadata     db.ContainerMetadata
+	stepMetadata          StepMetadata
 
 	resourceTypes creds.VersionedResourceTypes
 
@@ -53,8 +54,10 @@ func NewPutStep(
 	source creds.Source,
 	params creds.Params,
 	tags atc.Tags,
+	inputs PutInputs,
 	delegate PutDelegate,
 	resourceFactory resource.ResourceFactory,
+	resourceConfigFactory db.ResourceConfigFactory,
 	planID atc.PlanID,
 	containerMetadata db.ContainerMetadata,
 	stepMetadata StepMetadata,
@@ -63,18 +66,20 @@ func NewPutStep(
 	return &PutStep{
 		build: build,
 
-		resourceType:      resourceType,
-		name:              name,
-		resource:          resourceName,
-		source:            source,
-		params:            params,
-		tags:              tags,
-		delegate:          delegate,
-		resourceFactory:   resourceFactory,
-		planID:            planID,
-		containerMetadata: containerMetadata,
-		stepMetadata:      stepMetadata,
-		resourceTypes:     resourceTypes,
+		resourceType:          resourceType,
+		name:                  name,
+		resource:              resourceName,
+		source:                source,
+		params:                params,
+		tags:                  tags,
+		inputs:                inputs,
+		delegate:              delegate,
+		resourceFactory:       resourceFactory,
+		resourceConfigFactory: resourceConfigFactory,
+		planID:                planID,
+		containerMetadata:     containerMetadata,
+		stepMetadata:          stepMetadata,
+		resourceTypes:         resourceTypes,
 	}
 }
 
@@ -89,6 +94,11 @@ func NewPutStep(
 func (step *PutStep) Run(ctx context.Context, state RunState) error {
 	logger := lagerctx.FromContext(ctx)
 
+	containerInputs, err := step.inputs.FindAll(state.Artifacts())
+	if err != nil {
+		return err
+	}
+
 	containerSpec := worker.ContainerSpec{
 		ImageSpec: worker.ImageSpec{
 			ResourceType: step.resourceType,
@@ -99,21 +109,24 @@ func (step *PutStep) Run(ctx context.Context, state RunState) error {
 		Dir: resource.ResourcesDir("put"),
 
 		Env: step.stepMetadata.Env(),
+
+		Inputs: containerInputs,
 	}
 
-	for name, source := range state.Artifacts().AsMap() {
-		containerSpec.Inputs = append(containerSpec.Inputs, &putInputSource{
-			name:   name,
-			source: PutResourceSource{source},
-		})
+	workerSpec := worker.WorkerSpec{
+		ResourceType:  step.resourceType,
+		Tags:          step.tags,
+		TeamID:        step.build.TeamID(),
+		ResourceTypes: step.resourceTypes,
 	}
 
 	putResource, err := step.resourceFactory.NewResource(
 		ctx,
 		logger,
-		db.NewBuildStepContainerOwner(step.build.ID(), step.planID),
+		db.NewBuildStepContainerOwner(step.build.ID(), step.planID, step.build.TeamID()),
 		step.containerMetadata,
 		containerSpec,
+		workerSpec,
 		step.resourceTypes,
 		step.delegate,
 	)
@@ -158,14 +171,8 @@ func (step *PutStep) Run(ctx context.Context, state RunState) error {
 	}
 
 	if step.resource != "" {
-		err = step.build.SaveOutput(
-			db.VersionedResource{
-				Resource: step.resource,
-				Type:     step.resourceType,
-				Version:  db.ResourceVersion(step.versionInfo.Version),
-				Metadata: db.NewResourceMetadataFields(step.versionInfo.Metadata),
-			},
-		)
+		logger = logger.WithData(lager.Data{"step": step.name, "resource": step.resource, "resource-type": step.resourceType, "version": step.versionInfo.Version})
+		err = step.build.SaveOutput(logger, step.resourceType, source, step.resourceTypes, step.versionInfo.Version, db.NewResourceConfigMetadataFields(step.versionInfo.Metadata), step.name, step.resource)
 		if err != nil {
 			logger.Error("failed-to-save-output", err)
 			return err
@@ -189,23 +196,4 @@ func (step *PutStep) VersionInfo() VersionInfo {
 // Succeeded returns true if the resource script exited successfully.
 func (step *PutStep) Succeeded() bool {
 	return step.succeeded
-}
-
-type PutResourceSource struct {
-	worker.ArtifactSource
-}
-
-func (source PutResourceSource) StreamTo(dest worker.ArtifactDestination) error {
-	return source.ArtifactSource.StreamTo(worker.ArtifactDestination(dest))
-}
-
-type putInputSource struct {
-	name   worker.ArtifactName
-	source worker.ArtifactSource
-}
-
-func (s *putInputSource) Source() worker.ArtifactSource { return s.source }
-
-func (s *putInputSource) DestinationPath() string {
-	return resource.ResourcesDir("put/" + string(s.name))
 }

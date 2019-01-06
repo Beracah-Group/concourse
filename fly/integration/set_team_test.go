@@ -48,84 +48,23 @@ var _ = Describe("Fly CLI", func() {
 						Eventually(sess).Should(gexec.Exit(1))
 					})
 				})
+
+				Context("auth config contains empty user", func() {
+					BeforeEach(func() {
+						cmdParams = []string{"-c", "fixtures/team_config_empty_users.yml"}
+					})
+
+					It("returns an error", func() {
+						sess, err := gexec.Start(flyCmd, nil, nil)
+						Expect(err).ToNot(HaveOccurred())
+						Eventually(sess.Err).Should(gbytes.Say("You have not provided a list of users and groups for one of the roles in your config yaml."))
+						Eventually(sess).Should(gexec.Exit(1))
+					})
+				})
 			})
 		})
 
 		Describe("Display", func() {
-			Context("Setting no auth", func() {
-				Context("allow-all-users configuration provided", func() {
-					BeforeEach(func() {
-						cmdParams = []string{"-c", "fixtures/team_config.yml"}
-						confirmHandlers()
-					})
-
-					It("show a warning about creating unauthenticated team for a given role", func() {
-						stdin, err := flyCmd.StdinPipe()
-						Expect(err).NotTo(HaveOccurred())
-
-						sess, err := gexec.Start(flyCmd, nil, nil)
-						Expect(err).ToNot(HaveOccurred())
-
-						Eventually(sess.Out).Should(gbytes.Say("Team Name: venture"))
-
-						Eventually(sess.Out).Should(gbytes.Say("Users \\(member\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- local:some-user"))
-						Eventually(sess.Out).Should(gbytes.Say("Groups \\(member\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-
-						Eventually(sess.Out).Should(gbytes.Say("Users \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- local:some-admin"))
-						Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-
-						Eventually(sess.Out).Should(gbytes.Say("Users \\(viewer\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-						Eventually(sess.Out).Should(gbytes.Say("Groups \\(viewer\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-
-						Eventually(sess.Err).Should(gbytes.Say("WARNING:\nGranting role 'viewer' to ALL users. You asked for it!"))
-						Consistently(sess.Err).ShouldNot(gbytes.Say("WARNING:\nGranting role 'member' to ALL users. You asked for it!"))
-						Consistently(sess.Err).ShouldNot(gbytes.Say("WARNING:\nGranting role 'owner' to ALL users. You asked for it!"))
-
-						Eventually(sess).Should(gbytes.Say(`apply configuration\? \[yN\]: `))
-						yes(stdin)
-
-						Eventually(sess).Should(gexec.Exit(0))
-					})
-				})
-
-				Context("allow-all-users flag provided with other configuration for a given role", func() {
-					BeforeEach(func() {
-						cmdParams = []string{"-c", "fixtures/team_config_with_conflict.yml"}
-						confirmHandlers()
-					})
-
-					It("doesn't warn you because noauth has been removed", func() {
-						stdin, err := flyCmd.StdinPipe()
-						Expect(err).NotTo(HaveOccurred())
-
-						sess, err := gexec.Start(flyCmd, nil, nil)
-						Expect(err).ToNot(HaveOccurred())
-
-						Eventually(sess.Out).Should(gbytes.Say("Team Name: venture"))
-
-						Eventually(sess.Out).Should(gbytes.Say("Users \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- local:some-admin"))
-						Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-
-						Consistently(sess.Err).ShouldNot(gbytes.Say("WARNING:\nGranting role 'viewer' to ALL users. You asked for it!"))
-						Consistently(sess.Err).ShouldNot(gbytes.Say("WARNING:\nGranting role 'member' to ALL users. You asked for it!"))
-						Consistently(sess.Err).ShouldNot(gbytes.Say("WARNING:\nGranting role 'owner' to ALL users. You asked for it!"))
-
-						Eventually(sess).Should(gbytes.Say(`apply configuration\? \[yN\]: `))
-						yes(stdin)
-
-						Eventually(sess).Should(gexec.Exit(0))
-					})
-				})
-			})
-
 			Context("Setting local auth", func() {
 				BeforeEach(func() {
 					cmdParams = []string{"-c", "fixtures/team_config_with_local_auth.yml"}
@@ -275,6 +214,36 @@ var _ = Describe("Fly CLI", func() {
 					Eventually(sess).Should(gexec.Exit(1))
 				})
 			})
+
+			Context("Setting auth with empty values", func() {
+				BeforeEach(func() {
+					cmdParams = []string{"-c", "fixtures/team_config_empty_values.yml"}
+				})
+
+				It("shows the users and groups configured for a given role", func() {
+					sess, err := gexec.Start(flyCmd, nil, nil)
+					Expect(err).ToNot(HaveOccurred())
+
+					Eventually(sess.Out).Should(gbytes.Say("Team Name: venture"))
+
+					Eventually(sess.Out).Should(gbytes.Say("Users \\(member\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- none"))
+					Eventually(sess.Out).Should(gbytes.Say("Groups \\(member\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- github:some-org"))
+
+					Eventually(sess.Out).Should(gbytes.Say("Users \\(owner\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- local:some-admin"))
+					Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- none"))
+
+					Eventually(sess.Out).Should(gbytes.Say("Users \\(viewer\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- local:some-viewer"))
+					Eventually(sess.Out).Should(gbytes.Say("Groups \\(viewer\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- none"))
+
+					Eventually(sess).Should(gexec.Exit(1))
+				})
+			})
 		})
 
 		Describe("confirmation", func() {
@@ -343,7 +312,9 @@ var _ = Describe("Fly CLI", func() {
 									"groups": []
 								},
 								"viewer":{
-									"users": [],
+									"users": [
+										"local:some-viewer"
+									],
 									"groups": []
 								}
 							}
@@ -413,7 +384,9 @@ var _ = Describe("Fly CLI", func() {
 									"groups": []
 								},
 								"viewer":{
-									"users": [],
+									"users": [
+										"local:some-viewer"
+									],
 									"groups": []
 								}
 							}
@@ -452,9 +425,20 @@ var _ = Describe("Fly CLI", func() {
 					It("returns an error", func() {
 						sess, err := gexec.Start(flyCmd, nil, nil)
 						Expect(err).ToNot(HaveOccurred())
-						Eventually(sess.Err).Should(gbytes.Say("You have not provided a whitelist of users or groups. To continue, run:"))
-						Eventually(sess.Err).Should(gbytes.Say("fly -t testserver set-team -n venture --allow-all-users"))
-						Eventually(sess.Err).Should(gbytes.Say("This will allow team access to all logged in users in the system."))
+						Eventually(sess.Err).Should(gbytes.Say("You have not provided a list of users and groups for the specified team."))
+						Eventually(sess).Should(gexec.Exit(1))
+					})
+				})
+
+				Context("empty auth values provided", func() {
+					BeforeEach(func() {
+						cmdParams = []string{"--local-user", ""}
+					})
+
+					It("returns an error", func() {
+						sess, err := gexec.Start(flyCmd, nil, nil)
+						Expect(err).ToNot(HaveOccurred())
+						Eventually(sess.Err).Should(gbytes.Say("You have not provided a list of users and groups for the specified team."))
 						Eventually(sess).Should(gexec.Exit(1))
 					})
 				})
@@ -462,64 +446,6 @@ var _ = Describe("Fly CLI", func() {
 		})
 
 		Describe("Display", func() {
-			Context("Setting no auth", func() {
-				Context("allow-all-users flag provided", func() {
-					BeforeEach(func() {
-						cmdParams = []string{"--allow-all-users"}
-						confirmHandlers()
-					})
-
-					It("show a warning about creating unauthenticated team", func() {
-						stdin, err := flyCmd.StdinPipe()
-						Expect(err).NotTo(HaveOccurred())
-
-						sess, err := gexec.Start(flyCmd, nil, nil)
-						Expect(err).ToNot(HaveOccurred())
-
-						Eventually(sess.Out).Should(gbytes.Say("Team Name: venture"))
-						Eventually(sess.Out).Should(gbytes.Say("Users \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-						Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-
-						Eventually(sess.Err).Should(gbytes.Say("WARNING:\nGranting role 'owner' to ALL users. You asked for it!"))
-
-						Eventually(sess).Should(gbytes.Say(`apply configuration\? \[yN\]: `))
-						yes(stdin)
-
-						Eventually(sess).Should(gexec.Exit(0))
-					})
-				})
-
-				Context("allow-all-users flag provided with other configuration", func() {
-					BeforeEach(func() {
-						cmdParams = []string{"--local-user", "brock-samson", "--allow-all-users"}
-						confirmHandlers()
-					})
-
-					It("doesn't warn you because noauth has been removed", func() {
-						stdin, err := flyCmd.StdinPipe()
-						Expect(err).NotTo(HaveOccurred())
-
-						sess, err := gexec.Start(flyCmd, nil, nil)
-						Expect(err).ToNot(HaveOccurred())
-
-						Eventually(sess.Out).Should(gbytes.Say("Team Name: venture"))
-						Eventually(sess.Out).Should(gbytes.Say("Users \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- local:brock-samson"))
-						Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
-						Eventually(sess.Out).Should(gbytes.Say("- none"))
-
-						Consistently(sess.Err).ShouldNot(gbytes.Say("WARNING:\nGranting role 'owner' to ALL users. You asked for it!"))
-
-						Eventually(sess).Should(gbytes.Say(`apply configuration\? \[yN\]: `))
-						yes(stdin)
-
-						Eventually(sess).Should(gexec.Exit(0))
-					})
-				})
-			})
-
 			Context("Setting local auth", func() {
 				BeforeEach(func() {
 					cmdParams = []string{"--local-user", "brock-samson"}
@@ -615,6 +541,25 @@ var _ = Describe("Fly CLI", func() {
 					Eventually(sess.Out).Should(gbytes.Say("- none"))
 					Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
 					Eventually(sess.Out).Should(gbytes.Say("- oauth:cool-scope-name"))
+
+					Eventually(sess).Should(gexec.Exit(1))
+				})
+			})
+
+			Context("Setting auth with empty arguments", func() {
+				BeforeEach(func() {
+					cmdParams = []string{"--oauth-group", "", "--github-team", "samson-org:samson-team", "--github-user", ""}
+				})
+
+				It("ignores empty arguments", func() {
+					sess, err := gexec.Start(flyCmd, nil, nil)
+					Expect(err).ToNot(HaveOccurred())
+
+					Eventually(sess.Out).Should(gbytes.Say("Team Name: venture"))
+					Eventually(sess.Out).Should(gbytes.Say("Users \\(owner\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- none"))
+					Eventually(sess.Out).Should(gbytes.Say("Groups \\(owner\\):"))
+					Eventually(sess.Out).Should(gbytes.Say("- github:samson-org:samson-team"))
 
 					Eventually(sess).Should(gexec.Exit(1))
 				})

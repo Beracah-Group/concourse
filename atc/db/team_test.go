@@ -6,13 +6,11 @@ import (
 	"strconv"
 	"time"
 
-	sq "github.com/Masterminds/squirrel"
 	"github.com/cloudfoundry/bosh-cli/director/template"
 	"github.com/concourse/concourse/atc"
 	"github.com/concourse/concourse/atc/creds"
 	"github.com/concourse/concourse/atc/creds/credsfakes"
 	"github.com/concourse/concourse/atc/db"
-	"github.com/concourse/concourse/atc/db/dbfakes"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -304,12 +302,12 @@ var _ = Describe("Team", func() {
 
 			metaContainers = make(map[db.ContainerMetadata][]db.Container)
 			for _, meta := range sampleMetadata {
-				firstContainerCreating, err := defaultTeam.CreateContainer(defaultWorker.Name(), db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job")), meta)
+				firstContainerCreating, err := defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job"), defaultTeam.ID()), meta)
 				Expect(err).ToNot(HaveOccurred())
 
 				metaContainers[meta] = append(metaContainers[meta], firstContainerCreating)
 
-				secondContainerCreating, err := defaultTeam.CreateContainer(defaultWorker.Name(), db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job")), meta)
+				secondContainerCreating, err := defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job"), defaultTeam.ID()), meta)
 				Expect(err).ToNot(HaveOccurred())
 
 				secondContainerCreated, err := secondContainerCreating.Created()
@@ -317,7 +315,7 @@ var _ = Describe("Team", func() {
 
 				metaContainers[meta] = append(metaContainers[meta], secondContainerCreated)
 
-				thirdContainerCreating, err := defaultTeam.CreateContainer(defaultWorker.Name(), db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job")), meta)
+				thirdContainerCreating, err := defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job"), defaultTeam.ID()), meta)
 				Expect(err).ToNot(HaveOccurred())
 
 				thirdContainerCreated, err := thirdContainerCreating.Created()
@@ -408,100 +406,61 @@ var _ = Describe("Team", func() {
 		})
 	})
 
-	Describe("FindCheckContainers", func() {
+	Describe("Containers", func() {
 		var (
-			fakeVariablesFactory *credsfakes.FakeVariablesFactory
-			variables            creds.Variables
+			fakeVariablesFactory   *credsfakes.FakeVariablesFactory
+			variables              creds.Variables
+			resourceContainer      db.CreatingContainer
+			resourceConfig         db.ResourceConfig
+			firstContainerCreating db.CreatingContainer
 		)
-
-		expiries := db.ContainerOwnerExpiries{
-			GraceTime: 2 * time.Minute,
-			Min:       5 * time.Minute,
-			Max:       1 * time.Hour,
-		}
 
 		BeforeEach(func() {
 			fakeVariablesFactory = new(credsfakes.FakeVariablesFactory)
 			variables = template.StaticVariables{}
 			fakeVariablesFactory.NewVariablesReturns(variables)
+
+			job, found, err := defaultPipeline.Job("some-job")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
+			build, err := job.CreateBuild()
+			Expect(err).ToNot(HaveOccurred())
+
+			firstContainerCreating, err = defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job"), defaultTeam.ID()), db.ContainerMetadata{Type: "task", StepName: "some-task"})
+			Expect(err).ToNot(HaveOccurred())
+
+			expiries := db.ContainerOwnerExpiries{
+				GraceTime: 2 * time.Minute,
+				Min:       5 * time.Minute,
+				Max:       1 * time.Hour,
+			}
+
+			pipelineResourceTypes, err := defaultPipeline.ResourceTypes()
+			Expect(err).ToNot(HaveOccurred())
+
+			resourceConfig, err = defaultResource.SetResourceConfig(logger, defaultResource.Source(), creds.NewVersionedResourceTypes(variables, pipelineResourceTypes.Deserialize()))
+			Expect(err).ToNot(HaveOccurred())
+
+			resourceContainer, err = defaultWorker.CreateContainer(
+				db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, expiries),
+				db.ContainerMetadata{},
+			)
+			Expect(err).ToNot(HaveOccurred())
 		})
 
-		Context("when pipeline exists", func() {
-			Context("when resource exists", func() {
-				Context("when check container for resource exists", func() {
-					var resourceContainer db.CreatingContainer
-					var resourceConfigCheckSession db.ResourceConfigCheckSession
+		It("finds all the containers", func() {
+			containers, err := defaultTeam.Containers(logger)
+			Expect(err).ToNot(HaveOccurred())
 
-					BeforeEach(func() {
-						pipelineResourceTypes, err := defaultPipeline.ResourceTypes()
-						Expect(err).ToNot(HaveOccurred())
-
-						resourceConfigCheckSession, err = resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
-							logger,
-							defaultResource.Type(),
-							defaultResource.Source(),
-							creds.NewVersionedResourceTypes(variables, pipelineResourceTypes.Deserialize()),
-							expiries,
-						)
-						Expect(err).ToNot(HaveOccurred())
-
-						resourceContainer, err = defaultTeam.CreateContainer(
-							"default-worker",
-							db.NewResourceConfigCheckSessionContainerOwner(resourceConfigCheckSession, defaultTeam.ID()),
-							db.ContainerMetadata{},
-						)
-						Expect(err).ToNot(HaveOccurred())
-					})
-
-					It("returns check container for resource", func() {
-						containers, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "some-resource", fakeVariablesFactory)
-						Expect(err).ToNot(HaveOccurred())
-						Expect(containers).To(ContainElement(resourceContainer))
-					})
-
-					Context("when another team has a container with the same resource config", func() {
-						BeforeEach(func() {
-							_, err := otherTeam.CreateContainer(
-								"default-worker",
-								db.NewResourceConfigCheckSessionContainerOwner(resourceConfigCheckSession, defaultTeam.ID()),
-								db.ContainerMetadata{},
-							)
-							Expect(err).ToNot(HaveOccurred())
-						})
-
-						It("only returns container for current team", func() {
-							containers, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "some-resource", fakeVariablesFactory)
-							Expect(err).ToNot(HaveOccurred())
-							Expect(containers).To(HaveLen(1))
-							Expect(containers).To(ContainElement(resourceContainer))
-						})
-					})
-				})
-
-				Context("when check container does not exist", func() {
-					It("returns empty list", func() {
-						containers, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "some-resource", fakeVariablesFactory)
-						Expect(err).ToNot(HaveOccurred())
-						Expect(containers).To(BeEmpty())
-					})
-				})
-			})
-
-			Context("when resource does not exist", func() {
-				It("returns empty list", func() {
-					containers, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "non-existent-resource", fakeVariablesFactory)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(containers).To(BeEmpty())
-				})
-			})
+			Expect(containers).To(HaveLen(2))
+			Expect(containers).To(ConsistOf(firstContainerCreating, resourceContainer))
 		})
 
-		Context("when pipeline does not exist", func() {
-			It("returns empty list", func() {
-				containers, err := defaultTeam.FindCheckContainers(logger, "non-existent-pipeline", "some-resource", fakeVariablesFactory)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(containers).To(BeEmpty())
-			})
+		It("does not find containers for other teams", func() {
+			containers, err := otherTeam.Containers(logger)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(containers).To(BeEmpty())
 		})
 	})
 
@@ -516,7 +475,7 @@ var _ = Describe("Team", func() {
 			build, err := job.CreateBuild()
 			Expect(err).ToNot(HaveOccurred())
 
-			creatingContainer, err := defaultTeam.CreateContainer(defaultWorker.Name(), db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job")), db.ContainerMetadata{Type: "task", StepName: "some-task"})
+			creatingContainer, err := defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job"), defaultTeam.ID()), db.ContainerMetadata{Type: "task", StepName: "some-task"})
 			Expect(err).ToNot(HaveOccurred())
 
 			createdContainer, err = creatingContainer.Created()
@@ -543,12 +502,6 @@ var _ = Describe("Team", func() {
 			Expect(container).ToNot(BeNil())
 			Expect(container.Handle()).To(Equal(createdContainer.Handle()))
 		})
-
-		It("does not find container for another team", func() {
-			_, found, err := otherTeam.FindContainerByHandle(createdContainer.Handle())
-			Expect(err).ToNot(HaveOccurred())
-			Expect(found).To(BeFalse())
-		})
 	})
 
 	Describe("FindWorkerForContainer", func() {
@@ -570,7 +523,7 @@ var _ = Describe("Team", func() {
 
 			BeforeEach(func() {
 				var err error
-				container, err = defaultTeam.CreateContainer(defaultWorker.Name(), db.NewBuildStepContainerOwner(defaultBuild.ID(), "some-plan"), containerMetadata)
+				container, err = defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(defaultBuild.ID(), "some-plan", defaultTeam.ID()), containerMetadata)
 				Expect(err).ToNot(HaveOccurred())
 			})
 
@@ -581,20 +534,13 @@ var _ = Describe("Team", func() {
 				Expect(worker).ToNot(BeNil())
 				Expect(worker.Name()).To(Equal(defaultWorker.Name()))
 			})
-
-			It("does not find container for another team", func() {
-				worker, found, err := otherTeam.FindWorkerForContainer(container.Handle())
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeFalse())
-				Expect(worker).To(BeNil())
-			})
 		})
 
 		Context("when there is a created container", func() {
 			var container db.CreatedContainer
 
 			BeforeEach(func() {
-				creatingContainer, err := defaultTeam.CreateContainer(defaultWorker.Name(), db.NewBuildStepContainerOwner(defaultBuild.ID(), "some-plan"), containerMetadata)
+				creatingContainer, err := defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(defaultBuild.ID(), "some-plan", defaultTeam.ID()), containerMetadata)
 				Expect(err).ToNot(HaveOccurred())
 
 				container, err = creatingContainer.Created()
@@ -608,110 +554,11 @@ var _ = Describe("Team", func() {
 				Expect(worker).ToNot(BeNil())
 				Expect(worker.Name()).To(Equal(defaultWorker.Name()))
 			})
-
-			It("does not find container for another team", func() {
-				worker, found, err := otherTeam.FindWorkerForContainer(container.Handle())
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeFalse())
-				Expect(worker).To(BeNil())
-			})
 		})
 
 		Context("when there is no container", func() {
 			It("returns nil", func() {
 				worker, found, err := defaultTeam.FindWorkerForContainer("bogus-handle")
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeFalse())
-				Expect(worker).To(BeNil())
-			})
-		})
-	})
-
-	Describe("FindWorkerForContainerByOwner", func() {
-		var containerMetadata db.ContainerMetadata
-		var build db.Build
-		var fakeOwner *dbfakes.FakeContainerOwner
-
-		BeforeEach(func() {
-			var err error
-			containerMetadata = db.ContainerMetadata{
-				Type:     "task",
-				StepName: "some-task",
-			}
-			build, err = defaultTeam.CreateOneOffBuild()
-			Expect(err).ToNot(HaveOccurred())
-
-			fakeOwner = new(dbfakes.FakeContainerOwner)
-			fakeOwner.FindReturns(sq.Eq{
-				"build_id": build.ID(),
-				"plan_id":  "simple-plan",
-			}, true, nil)
-			fakeOwner.CreateReturns(map[string]interface{}{
-				"build_id": build.ID(),
-				"plan_id":  "simple-plan",
-			}, nil)
-		})
-
-		Context("when there is a creating container", func() {
-			BeforeEach(func() {
-				_, err := defaultTeam.CreateContainer(defaultWorker.Name(), fakeOwner, containerMetadata)
-				Expect(err).ToNot(HaveOccurred())
-			})
-
-			It("returns it", func() {
-				worker, found, err := defaultTeam.FindWorkerForContainerByOwner(fakeOwner)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeTrue())
-				Expect(worker).ToNot(BeNil())
-				Expect(worker.Name()).To(Equal(defaultWorker.Name()))
-			})
-
-			It("does not find container for another team", func() {
-				worker, found, err := otherTeam.FindWorkerForContainerByOwner(fakeOwner)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeFalse())
-				Expect(worker).To(BeNil())
-			})
-		})
-
-		Context("when there is a created container", func() {
-			BeforeEach(func() {
-				creatingContainer, err := defaultTeam.CreateContainer(defaultWorker.Name(), fakeOwner, containerMetadata)
-				Expect(err).ToNot(HaveOccurred())
-
-				_, err = creatingContainer.Created()
-				Expect(err).ToNot(HaveOccurred())
-			})
-
-			It("returns it", func() {
-				worker, found, err := defaultTeam.FindWorkerForContainerByOwner(fakeOwner)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeTrue())
-				Expect(worker).ToNot(BeNil())
-				Expect(worker.Name()).To(Equal(defaultWorker.Name()))
-			})
-
-			It("does not find container for another team", func() {
-				worker, found, err := otherTeam.FindWorkerForContainerByOwner(fakeOwner)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(found).To(BeFalse())
-				Expect(worker).To(BeNil())
-			})
-		})
-
-		Context("when there is no container", func() {
-			It("returns nil", func() {
-				bogusOwner := new(dbfakes.FakeContainerOwner)
-				bogusOwner.FindReturns(sq.Eq{
-					"build_id": build.ID() + 1,
-					"plan_id":  "how-could-this-happen-to-me",
-				}, true, nil)
-				bogusOwner.CreateReturns(map[string]interface{}{
-					"build_id": build.ID() + 1,
-					"plan_id":  "how-could-this-happen-to-me",
-				}, nil)
-
-				worker, found, err := defaultTeam.FindWorkerForContainerByOwner(bogusOwner)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(found).To(BeFalse())
 				Expect(worker).To(BeNil())
@@ -1075,7 +922,6 @@ var _ = Describe("Team", func() {
 				Expect(len(builds)).To(Equal(2))
 				Expect(builds[0]).To(Equal(allBuilds[2]))
 				Expect(builds[1]).To(Equal(allBuilds[1]))
-
 				Expect(pagination.Previous).To(Equal(&db.Page{Until: allBuilds[2].ID(), Limit: 2}))
 				Expect(pagination.Next).To(Equal(&db.Page{Since: allBuilds[1].ID(), Limit: 2}))
 			})
@@ -1153,16 +999,17 @@ var _ = Describe("Team", func() {
 		})
 	})
 
-	Describe("Builds", func() {
+	Describe("BuildsWithTime", func() {
 		var (
-			expectedBuilds []db.Build
-			pipeline       db.Pipeline
+			pipeline db.Pipeline
+			builds   = make([]db.Build, 4)
 		)
 
 		BeforeEach(func() {
-			oneOfAKind, err := team.CreateOneOffBuild()
-			Expect(err).NotTo(HaveOccurred())
-			expectedBuilds = append(expectedBuilds, oneOfAKind)
+			var (
+				err   error
+				found bool
+			)
 
 			config := atc.Config{
 				Jobs: atc.JobConfigs{
@@ -1181,11 +1028,117 @@ var _ = Describe("Team", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(found).To(BeTrue())
 
-			build, err := job.CreateBuild()
+			for i := range builds {
+				builds[i], err = job.CreateBuild()
+				Expect(err).ToNot(HaveOccurred())
+
+				buildStart := time.Date(2020, 11, i+1, 0, 0, 0, 0, time.UTC)
+				_, err = dbConn.Exec("UPDATE builds SET start_time = to_timestamp($1) WHERE id = $2", buildStart.Unix(), builds[i].ID())
+				Expect(err).NotTo(HaveOccurred())
+
+				builds[i], found, err = job.Build(builds[i].Name())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(found).To(BeTrue())
+			}
+		})
+
+		Context("When not providing boundaries", func() {
+			Context("without a limit specified", func() {
+				It("returns no builds", func() {
+					returnedBuilds, _, err := team.BuildsWithTime(db.Page{})
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(returnedBuilds).To(BeEmpty())
+				})
+			})
+
+			Context("when a limit specified", func() {
+				It("returns a subset of the builds", func() {
+					returnedBuilds, _, err := team.BuildsWithTime(db.Page{
+						Limit: 2,
+					})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(returnedBuilds).To(ConsistOf(builds[3], builds[2]))
+				})
+			})
+
+		})
+
+		Context("When providing boundaries", func() {
+			Context("only until", func() {
+				It("returns only those before until", func() {
+					returnedBuilds, _, err := team.BuildsWithTime(db.Page{
+						Until: int(builds[2].StartTime().Unix()),
+						Limit: 50,
+					})
+
+					Expect(err).NotTo(HaveOccurred())
+					Expect(returnedBuilds).To(ConsistOf(builds[0], builds[1], builds[2]))
+				})
+			})
+
+			Context("only since", func() {
+				It("returns only those after since", func() {
+					returnedBuilds, _, err := team.BuildsWithTime(db.Page{
+						Since: int(builds[1].StartTime().Unix()),
+						Limit: 50,
+					})
+
+					Expect(err).NotTo(HaveOccurred())
+					Expect(returnedBuilds).To(ConsistOf(builds[1], builds[2], builds[3]))
+				})
+			})
+
+			Context("since and until", func() {
+				It("returns only elements in the range", func() {
+					returnedBuilds, _, err := team.BuildsWithTime(db.Page{
+						Until: int(builds[2].StartTime().Unix()),
+						Since: int(builds[1].StartTime().Unix()),
+						Limit: 50,
+					})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(returnedBuilds).To(ConsistOf(builds[1], builds[2]))
+				})
+			})
+		})
+	})
+
+	Describe("Builds", func() {
+		var (
+			expectedBuilds                              []db.Build
+			pipeline                                    db.Pipeline
+			oneOffBuild, build, secondBuild, thirdBuild db.Build
+		)
+
+		BeforeEach(func() {
+			var err error
+
+			oneOffBuild, err = team.CreateOneOffBuild()
+			Expect(err).NotTo(HaveOccurred())
+			expectedBuilds = append(expectedBuilds, oneOffBuild)
+
+			config := atc.Config{
+				Jobs: atc.JobConfigs{
+					{
+						Name: "some-job",
+					},
+					{
+						Name: "some-other-job",
+					},
+				},
+			}
+			pipeline, _, err = team.SavePipeline("some-pipeline", config, db.ConfigVersion(1), db.PipelineUnpaused)
+			Expect(err).ToNot(HaveOccurred())
+
+			job, found, err := pipeline.Job("some-job")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
+			build, err = job.CreateBuild()
 			Expect(err).ToNot(HaveOccurred())
 			expectedBuilds = append(expectedBuilds, build)
 
-			secondBuild, err := job.CreateBuild()
+			secondBuild, err = job.CreateBuild()
 			Expect(err).ToNot(HaveOccurred())
 			expectedBuilds = append(expectedBuilds, secondBuild)
 
@@ -1193,7 +1146,7 @@ var _ = Describe("Team", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(found).To(BeTrue())
 
-			thirdBuild, err := someOtherJob.CreateBuild()
+			thirdBuild, err = someOtherJob.CreateBuild()
 			Expect(err).ToNot(HaveOccurred())
 			expectedBuilds = append(expectedBuilds, thirdBuild)
 		})
@@ -1202,6 +1155,47 @@ var _ = Describe("Team", func() {
 			builds, _, err := team.Builds(db.Page{Limit: 10})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(builds).To(ConsistOf(expectedBuilds))
+		})
+
+		Context("when limiting the range of build ids", func() {
+			Context("specifying only until", func() {
+				It("returns all builds after the specified id", func() {
+					builds, _, err := team.Builds(db.Page{Limit: 50, Until: secondBuild.ID()})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(builds).To(ConsistOf(thirdBuild))
+				})
+			})
+
+			Context("specifying only since", func() {
+				It("returns all builds before the specified id", func() {
+					builds, _, err := team.Builds(db.Page{Limit: 50, Since: secondBuild.ID()})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(builds).To(ConsistOf(oneOffBuild, build))
+				})
+			})
+
+			Context("specifying both since and until", func() {
+				It("returns all builds within range of ids", func() {
+					builds, _, err := team.Builds(db.Page{Limit: 50, Since: thirdBuild.ID(), Until: build.ID()})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(builds).To(ConsistOf(secondBuild))
+				})
+			})
+
+			Context("specifying since greater than the biggest ID in the database", func() {
+				It("returns no rows error", func() {
+					builds, _, err := team.Builds(db.Page{Limit: 50, Until: thirdBuild.ID() + 1})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(builds).To(BeEmpty())
+				})
+			})
+
+			Context("specifying invalid boundaries", func() {
+				It("should fail", func() {
+					_, _, err := team.Builds(db.Page{Limit: 50, Since: secondBuild.ID(), Until: thirdBuild.ID()})
+					Expect(err).To(HaveOccurred())
+				})
+			})
 		})
 
 		Context("when there are builds that belong to different teams", func() {
@@ -1464,6 +1458,107 @@ var _ = Describe("Team", func() {
 			Expect(resource.Source()).To(Equal(atc.Source{
 				"source-other-config": "some-other-value",
 			}))
+		})
+
+		It("clears out api pinned version when resaving a pinned version on the pipeline config", func() {
+			pipeline, _, err := team.SavePipeline(pipelineName, config, 0, db.PipelineNoChange)
+			Expect(err).ToNot(HaveOccurred())
+
+			resource, found, err := pipeline.Resource("some-resource")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
+			setupTx, err := dbConn.Begin()
+			Expect(err).ToNot(HaveOccurred())
+
+			brt := db.BaseResourceType{
+				Name: "some-type",
+			}
+			_, err = brt.FindOrCreate(setupTx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(setupTx.Commit()).To(Succeed())
+
+			rc, err := resource.SetResourceConfig(logger, atc.Source{"source-config": "some-value"}, creds.VersionedResourceTypes{})
+			Expect(err).ToNot(HaveOccurred())
+
+			err = rc.SaveVersions([]atc.Version{
+				atc.Version{"version": "v1"},
+				atc.Version{"version": "v2"},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			rcv, found, err := rc.FindVersion(atc.Version{"version": "v1"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
+			err = resource.PinVersion(rcv.ID())
+			Expect(err).ToNot(HaveOccurred())
+
+			reloaded, err := resource.Reload()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reloaded).To(BeTrue())
+			Expect(resource.APIPinnedVersion()).To(Equal(atc.Version{"version": "v1"}))
+
+			config.Resources[0].Version = atc.Version{
+				"version": "v2",
+			}
+
+			savedPipeline, _, err := team.SavePipeline(pipelineName, config, pipeline.ConfigVersion(), db.PipelineNoChange)
+			Expect(err).ToNot(HaveOccurred())
+
+			resource, found, err = savedPipeline.Resource("some-resource")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(resource.ConfigPinnedVersion()).To(Equal(atc.Version{"version": "v2"}))
+			Expect(resource.APIPinnedVersion()).To(BeNil())
+		})
+
+		It("does not clear the api pinned version when resaving pipeline config", func() {
+			pipeline, _, err := team.SavePipeline(pipelineName, config, 0, db.PipelineNoChange)
+			Expect(err).ToNot(HaveOccurred())
+
+			resource, found, err := pipeline.Resource("some-resource")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
+			setupTx, err := dbConn.Begin()
+			Expect(err).ToNot(HaveOccurred())
+
+			brt := db.BaseResourceType{
+				Name: "some-type",
+			}
+			_, err = brt.FindOrCreate(setupTx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(setupTx.Commit()).To(Succeed())
+
+			rc, err := resource.SetResourceConfig(logger, atc.Source{"source-config": "some-value"}, creds.VersionedResourceTypes{})
+			Expect(err).ToNot(HaveOccurred())
+
+			err = rc.SaveVersions([]atc.Version{
+				atc.Version{"version": "v1"},
+				atc.Version{"version": "v2"},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			rcv, found, err := rc.FindVersion(atc.Version{"version": "v1"})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+
+			err = resource.PinVersion(rcv.ID())
+			Expect(err).ToNot(HaveOccurred())
+
+			reloaded, err := resource.Reload()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(reloaded).To(BeTrue())
+			Expect(resource.APIPinnedVersion()).To(Equal(atc.Version{"version": "v1"}))
+
+			savedPipeline, _, err := team.SavePipeline(pipelineName, config, pipeline.ConfigVersion(), db.PipelineNoChange)
+			Expect(err).ToNot(HaveOccurred())
+
+			resource, found, err = savedPipeline.Resource("some-resource")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(resource.APIPinnedVersion()).To(Equal(atc.Version{"version": "v1"}))
 		})
 
 		It("marks resource as inactive if it is no longer in config", func() {
@@ -2001,14 +2096,10 @@ var _ = Describe("Team", func() {
 		})
 	})
 
-	Describe("FindContainerOnWorker/CreateContainer", func() {
+	Describe("FindCheckContainers", func() {
 		var (
-			containerMetadata db.ContainerMetadata
-			team              db.Team
-			containerOwner    db.ContainerOwner
-
-			foundCreatingContainer db.CreatingContainer
-			foundCreatedContainer  db.CreatedContainer
+			fakeVariablesFactory *credsfakes.FakeVariablesFactory
+			variables            creds.Variables
 		)
 
 		expiries := db.ContainerOwnerExpiries{
@@ -2018,130 +2109,225 @@ var _ = Describe("Team", func() {
 		}
 
 		BeforeEach(func() {
-			containerMetadata = db.ContainerMetadata{
-				Type:     "task",
-				StepName: "some-task",
+			fakeVariablesFactory = new(credsfakes.FakeVariablesFactory)
+			variables = template.StaticVariables{}
+			fakeVariablesFactory.NewVariablesReturns(variables)
+		})
+
+		Context("when pipeline exists", func() {
+			Context("when resource exists", func() {
+				Context("when check container for resource exists", func() {
+					var resourceContainer db.CreatingContainer
+					var resourceConfig db.ResourceConfig
+
+					BeforeEach(func() {
+						pipelineResourceTypes, err := defaultPipeline.ResourceTypes()
+						Expect(err).ToNot(HaveOccurred())
+
+						resourceConfig, err = resourceConfigFactory.FindOrCreateResourceConfig(
+							logger,
+							defaultResource.Type(),
+							defaultResource.Source(),
+							creds.NewVersionedResourceTypes(variables, pipelineResourceTypes.Deserialize()),
+						)
+						Expect(err).ToNot(HaveOccurred())
+
+						resourceContainer, err = defaultWorker.CreateContainer(
+							db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, expiries),
+							db.ContainerMetadata{},
+						)
+						Expect(err).ToNot(HaveOccurred())
+					})
+
+					It("returns check container for resource", func() {
+						containers, checkContainersExpiresAt, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "some-resource", fakeVariablesFactory)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(containers).To(HaveLen(1))
+						Expect(containers[0].ID()).To(Equal(resourceContainer.ID()))
+						Expect(checkContainersExpiresAt).To(HaveLen(1))
+						Expect(checkContainersExpiresAt[resourceContainer.ID()]).ToNot(BeNil())
+					})
+
+					Context("when there are multiple resources with the same resource config", func() {
+						var (
+							otherPipeline          db.Pipeline
+							otherResource          db.Resource
+							otherResourceContainer db.CreatingContainer
+							found                  bool
+							err                    error
+						)
+
+						BeforeEach(func() {
+							otherPipeline, _, err = defaultTeam.SavePipeline("other-pipeline", atc.Config{
+								Resources: atc.ResourceConfigs{
+									{
+										Name: "some-resource",
+										Type: "some-base-resource-type",
+										Source: atc.Source{
+											"some": "source",
+										},
+									},
+								},
+							}, db.ConfigVersion(0), db.PipelineUnpaused)
+							Expect(err).NotTo(HaveOccurred())
+
+							otherResource, found, err = otherPipeline.Resource("some-resource")
+							Expect(err).NotTo(HaveOccurred())
+							Expect(found).To(BeTrue())
+
+							resourceConfig, err = resourceConfigFactory.FindOrCreateResourceConfig(
+								logger,
+								otherResource.Type(),
+								otherResource.Source(),
+								creds.VersionedResourceTypes{},
+							)
+							Expect(err).ToNot(HaveOccurred())
+
+							otherResourceContainer, _, err = defaultWorker.FindContainerOnWorker(
+								db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, expiries),
+							)
+							Expect(err).ToNot(HaveOccurred())
+						})
+
+						It("returns the same check container", func() {
+							containers, checkContainersExpiresAt, err := defaultTeam.FindCheckContainers(logger, "other-pipeline", "some-resource", fakeVariablesFactory)
+							Expect(err).ToNot(HaveOccurred())
+							Expect(containers).To(HaveLen(1))
+							Expect(containers[0].ID()).To(Equal(otherResourceContainer.ID()))
+							Expect(otherResourceContainer.ID()).To(Equal(resourceContainer.ID()))
+							Expect(checkContainersExpiresAt).To(HaveLen(1))
+							Expect(checkContainersExpiresAt[resourceContainer.ID()]).ToNot(BeNil())
+						})
+					})
+				})
+
+				Context("when check container does not exist", func() {
+					It("returns empty list", func() {
+						containers, checkContainersExpiresAt, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "some-resource", fakeVariablesFactory)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(containers).To(BeEmpty())
+						Expect(checkContainersExpiresAt).To(BeEmpty())
+					})
+				})
+			})
+
+			Context("when resource does not exist", func() {
+				It("returns empty list", func() {
+					containers, checkContainersExpiresAt, err := defaultTeam.FindCheckContainers(logger, "default-pipeline", "non-existent-resource", fakeVariablesFactory)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(containers).To(BeEmpty())
+					Expect(checkContainersExpiresAt).To(BeEmpty())
+				})
+			})
+		})
+
+		Context("when pipeline does not exist", func() {
+			It("returns empty list", func() {
+				containers, checkContainersExpiresAt, err := defaultTeam.FindCheckContainers(logger, "non-existent-pipeline", "some-resource", fakeVariablesFactory)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(containers).To(BeEmpty())
+				Expect(checkContainersExpiresAt).To(BeEmpty())
+			})
+		})
+	})
+
+	Describe("IsContainerWithinTeam", func() {
+		Context("when the container is a check container", func() {
+			var resourceContainer db.Container
+			expiries := db.ContainerOwnerExpiries{
+				GraceTime: 2 * time.Minute,
+				Min:       5 * time.Minute,
+				Max:       1 * time.Hour,
 			}
 
-			team = defaultTeam
-			_, err := team.SaveWorker(atc.Worker{
-				Name:      "fake-worker",
-				Team:      "default-team",
-				StartTime: 1501703719,
-				ResourceTypes: []atc.WorkerResourceType{
-					{
-						Type:       "fake-resource-type",
-						Image:      "fake-image",
-						Version:    "fake-version",
-						Privileged: false,
-					},
-				},
-			}, 1*time.Hour)
-			Expect(err).ToNot(HaveOccurred())
-
-			resourceConfigCheckSession, err := resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
-				logger,
-				defaultResource.Type(),
-				defaultResource.Source(),
-				creds.VersionedResourceTypes{},
-				expiries,
-			)
-			Expect(err).ToNot(HaveOccurred())
-
-			containerOwner = db.NewResourceConfigCheckSessionContainerOwner(resourceConfigCheckSession, team.ID())
-		})
-
-		JustBeforeEach(func() {
-			var err error
-			foundCreatingContainer, foundCreatedContainer, err = team.FindContainerOnWorker(defaultWorker.Name(), containerOwner)
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		Context("when there is a creating container", func() {
-			var creatingContainer db.CreatingContainer
-
 			BeforeEach(func() {
-				var err error
-				creatingContainer, err = defaultTeam.CreateContainer(defaultWorker.Name(), containerOwner, containerMetadata)
+				resourceConfig, err := defaultResource.SetResourceConfig(
+					logger,
+					defaultResource.Source(),
+					creds.VersionedResourceTypes{},
+				)
+				Expect(err).ToNot(HaveOccurred())
+
+				resourceContainer, err = defaultWorker.CreateContainer(
+					db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, expiries),
+					db.ContainerMetadata{},
+				)
 				Expect(err).ToNot(HaveOccurred())
 			})
 
-			It("returns it", func() {
-				Expect(foundCreatedContainer).To(BeNil())
-				Expect(foundCreatingContainer).ToNot(BeNil())
-			})
+			Context("when the container does belong on the team", func() {
+				var ok bool
 
-			Context("when finding on another team", func() {
-				BeforeEach(func() {
-					team = otherTeam
-				})
-
-				It("does not find it", func() {
-					Expect(foundCreatingContainer).To(BeNil())
-					Expect(foundCreatedContainer).To(BeNil())
-				})
-			})
-
-			Context("when there is a created container", func() {
-				BeforeEach(func() {
-					_, err := creatingContainer.Created()
-					Expect(err).ToNot(HaveOccurred())
-				})
-
-				It("returns it", func() {
-					Expect(foundCreatedContainer).ToNot(BeNil())
-					Expect(foundCreatingContainer).To(BeNil())
-				})
-
-				Context("when finding on another team", func() {
-					BeforeEach(func() {
-						team = otherTeam
-					})
-
-					It("does not find it", func() {
-						Expect(foundCreatingContainer).To(BeNil())
-						Expect(foundCreatedContainer).To(BeNil())
-					})
-				})
-			})
-
-			Context("when the creating container is failed and gced", func() {
 				BeforeEach(func() {
 					var err error
-					_, err = creatingContainer.Failed()
+					ok, err = defaultTeam.IsContainerWithinTeam(resourceContainer.Handle(), true)
 					Expect(err).ToNot(HaveOccurred())
-
-					containerRepository := db.NewContainerRepository(dbConn)
-					containersDestroyed, err := containerRepository.DestroyFailedContainers()
-					Expect(containersDestroyed).To(Equal(1))
-					Expect(err).ToNot(HaveOccurred())
-
-					var checkSessions int
-					err = dbConn.QueryRow("SELECT COUNT(*) FROM worker_resource_config_check_sessions").Scan(&checkSessions)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(checkSessions).To(Equal(1))
 				})
 
-				Context("and we create a new container", func() {
-					BeforeEach(func() {
-						_, err := defaultTeam.CreateContainer(defaultWorker.Name(), containerOwner, containerMetadata)
-						Expect(err).ToNot(HaveOccurred())
-					})
+				It("finds the container for the team", func() {
+					Expect(ok).To(BeTrue())
+				})
+			})
 
-					It("does not duplicate the worker resource config check session", func() {
-						var checkSessions int
-						err := dbConn.QueryRow("SELECT COUNT(*) FROM worker_resource_config_check_sessions").Scan(&checkSessions)
-						Expect(err).ToNot(HaveOccurred())
-						Expect(checkSessions).To(Equal(1))
-					})
+			Context("when the container does not belong on the team", func() {
+				var ok bool
+
+				BeforeEach(func() {
+					var err error
+					ok, err = team.IsContainerWithinTeam(resourceContainer.Handle(), true)
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				It("finds the container for the team", func() {
+					Expect(ok).To(BeFalse())
 				})
 			})
 		})
 
-		Context("when there is no container", func() {
-			It("returns nil", func() {
-				Expect(foundCreatedContainer).To(BeNil())
-				Expect(foundCreatingContainer).To(BeNil())
+		Context("when the container is owned by a team", func() {
+			var createdContainer db.Container
+
+			BeforeEach(func() {
+				job, found, err := defaultPipeline.Job("some-job")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(found).To(BeTrue())
+
+				build, err := job.CreateBuild()
+				Expect(err).ToNot(HaveOccurred())
+
+				creatingContainer, err := defaultWorker.CreateContainer(db.NewBuildStepContainerOwner(build.ID(), atc.PlanID("some-job"), defaultTeam.ID()), db.ContainerMetadata{Type: "task", StepName: "some-task"})
+				Expect(err).ToNot(HaveOccurred())
+
+				createdContainer, err = creatingContainer.Created()
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			Context("when the container does belong on the team", func() {
+				var ok bool
+
+				BeforeEach(func() {
+					var err error
+					ok, err = defaultTeam.IsContainerWithinTeam(createdContainer.Handle(), false)
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				It("finds the container for the team", func() {
+					Expect(ok).To(BeTrue())
+				})
+			})
+
+			Context("when the container does not belong on the team", func() {
+				var ok bool
+
+				BeforeEach(func() {
+					var err error
+					ok, err = team.IsContainerWithinTeam(createdContainer.Handle(), false)
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				It("finds the container for the team", func() {
+					Expect(ok).To(BeFalse())
+				})
 			})
 		})
 	})

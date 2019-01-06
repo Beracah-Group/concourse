@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"time"
 
-	"code.cloudfoundry.org/clock/fakeclock"
 	"code.cloudfoundry.org/garden"
 	"code.cloudfoundry.org/garden/gardenfakes"
 	"code.cloudfoundry.org/lager"
@@ -42,6 +40,7 @@ var _ = Describe("ContainerProvider", func() {
 		fakeImageFactory       *workerfakes.FakeImageFactory
 		fakeImage              *workerfakes.FakeImage
 		fakeDBTeam             *dbfakes.FakeTeam
+		fakeDBWorker           *dbfakes.FakeWorker
 		fakeDBVolumeRepository *dbfakes.FakeVolumeRepository
 		fakeLockFactory        *lockfakes.FakeLockFactory
 
@@ -60,6 +59,7 @@ var _ = Describe("ContainerProvider", func() {
 
 		ctx                context.Context
 		containerSpec      ContainerSpec
+		workerSpec         WorkerSpec
 		fakeContainerOwner *dbfakes.FakeContainerOwner
 		containerMetadata  db.ContainerMetadata
 		resourceTypes      creds.VersionedResourceTypes
@@ -100,21 +100,18 @@ var _ = Describe("ContainerProvider", func() {
 		fakeDBTeam = new(dbfakes.FakeTeam)
 		fakeDBTeamFactory.GetByIDReturns(fakeDBTeam)
 		fakeDBVolumeRepository = new(dbfakes.FakeVolumeRepository)
-		fakeClock := fakeclock.NewFakeClock(time.Unix(0, 123))
 		fakeGardenContainer = new(gardenfakes.FakeContainer)
 		fakeGardenClient.CreateReturns(fakeGardenContainer, nil)
 
-		fakeDBWorker := new(dbfakes.FakeWorker)
+		fakeDBWorker = new(dbfakes.FakeWorker)
 		fakeDBWorker.HTTPProxyURLReturns("http://proxy.com")
 		fakeDBWorker.HTTPSProxyURLReturns("https://proxy.com")
 		fakeDBWorker.NoProxyReturns("http://noproxy.com")
 
 		containerProvider = NewContainerProvider(
 			fakeGardenClient,
-			fakeBaggageclaimClient,
 			fakeVolumeClient,
 			fakeDBWorker,
-			fakeClock,
 			fakeImageFactory,
 			fakeDBVolumeRepository,
 			fakeDBTeamFactory,
@@ -250,6 +247,12 @@ var _ = Describe("ContainerProvider", func() {
 				Version: atc.Version{"some": "version"},
 			},
 		})
+
+		workerSpec = WorkerSpec{
+			TeamID:        73410,
+			ResourceType:  "registry-image",
+			ResourceTypes: resourceTypes,
+		}
 	})
 
 	CertsVolumeExists := func() {
@@ -257,50 +260,697 @@ var _ = Describe("ContainerProvider", func() {
 		fakeBaggageclaimClient.LookupVolumeReturns(fakeCertsVolume, true, nil)
 	}
 
-	ItHandlesContainerInCreatingState := func() {
-		Context("when container exists in garden", func() {
+	Describe("FindOrCreateContainer", func() {
+		BeforeEach(func() {
+			fakeDBWorker.CreateContainerReturns(fakeCreatingContainer, nil)
+			fakeLockFactory.AcquireReturns(new(lockfakes.FakeLock), true, nil)
+		})
+
+		JustBeforeEach(func() {
+			findOrCreateContainer, findOrCreateErr = containerProvider.FindOrCreateContainer(
+				ctx,
+				logger,
+				fakeContainerOwner,
+				fakeImageFetchingDelegate,
+				containerMetadata,
+				containerSpec,
+				workerSpec,
+				resourceTypes,
+			)
+		})
+
+		Context("when container exists in database in creating state", func() {
 			BeforeEach(func() {
-				fakeGardenClient.LookupReturns(fakeGardenContainer, nil)
+				fakeDBWorker.FindContainerOnWorkerReturns(fakeCreatingContainer, nil, nil)
 			})
 
-			It("does not acquire lock", func() {
-				Expect(fakeLockFactory.AcquireCallCount()).To(Equal(0))
+			Context("when container exists in garden", func() {
+				BeforeEach(func() {
+					fakeGardenClient.LookupReturns(fakeGardenContainer, nil)
+				})
+
+				It("does not acquire lock", func() {
+					Expect(fakeLockFactory.AcquireCallCount()).To(Equal(0))
+				})
+
+				It("marks container as created", func() {
+					Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(1))
+				})
+
+				It("returns worker container", func() {
+					Expect(findOrCreateContainer).ToNot(BeNil())
+				})
 			})
 
-			It("marks container as created", func() {
-				Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(1))
-			})
+			Context("when container does not exist in garden", func() {
+				BeforeEach(func() {
+					fakeGardenClient.LookupReturns(nil, garden.ContainerNotFoundError{})
+				})
+				BeforeEach(CertsVolumeExists)
 
-			It("returns worker container", func() {
-				Expect(findOrCreateContainer).ToNot(BeNil())
+				It("gets image", func() {
+					Expect(fakeImageFactory.GetImageCallCount()).To(Equal(1))
+					Expect(fakeImage.FetchForContainerCallCount()).To(Equal(1))
+				})
+
+				It("acquires lock", func() {
+					Expect(fakeLockFactory.AcquireCallCount()).To(Equal(1))
+				})
+
+				It("creates container in garden", func() {
+					Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+				})
+
+				It("marks container as created", func() {
+					Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(1))
+				})
+
+				It("returns worker container", func() {
+					Expect(findOrCreateContainer).ToNot(BeNil())
+				})
+
+				Context("when failing to create container in garden", func() {
+					BeforeEach(func() {
+						fakeGardenClient.CreateReturns(nil, disasterErr)
+					})
+
+					It("returns an error", func() {
+						Expect(findOrCreateErr).To(Equal(disasterErr))
+					})
+
+					It("does not mark container as created", func() {
+						Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(0))
+					})
+				})
+
+				Context("when getting image fails", func() {
+					BeforeEach(func() {
+						fakeImageFactory.GetImageReturns(nil, disasterErr)
+					})
+
+					It("returns an error", func() {
+						Expect(findOrCreateErr).To(Equal(disasterErr))
+					})
+
+					It("does not create container in garden", func() {
+						Expect(fakeGardenClient.CreateCallCount()).To(Equal(0))
+					})
+				})
 			})
 		})
 
-		Context("when container does not exist in garden", func() {
+		Context("when container exists in database in created state", func() {
 			BeforeEach(func() {
-				fakeGardenClient.LookupReturns(nil, garden.ContainerNotFoundError{})
+				fakeDBWorker.FindContainerOnWorkerReturns(nil, fakeCreatedContainer, nil)
 			})
-			BeforeEach(CertsVolumeExists)
+
+			Context("when container exists in garden", func() {
+				BeforeEach(func() {
+					fakeGardenClient.LookupReturns(fakeGardenContainer, nil)
+				})
+
+				It("returns container", func() {
+					Expect(findOrCreateContainer).ToNot(BeNil())
+				})
+			})
+
+			Context("when container does not exist in garden", func() {
+				var containerNotFoundErr error
+
+				BeforeEach(func() {
+					containerNotFoundErr = garden.ContainerNotFoundError{}
+					fakeGardenClient.LookupReturns(nil, containerNotFoundErr)
+				})
+
+				It("returns an error", func() {
+					Expect(findOrCreateErr).To(Equal(containerNotFoundErr))
+				})
+			})
+		})
+
+		Context("when container does not exist in database", func() {
+			BeforeEach(func() {
+				fakeDBWorker.FindContainerOnWorkerReturns(nil, nil, nil)
+			})
+
+			Context("when the certs volume does not exist on the worker", func() {
+				BeforeEach(func() {
+					fakeBaggageclaimClient.LookupVolumeReturns(nil, false, nil)
+				})
+				It("creates the container in garden, but does not bind mount any certs", func() {
+					Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+					actualSpec := fakeGardenClient.CreateArgsForCall(0)
+					Expect(actualSpec.BindMounts).ToNot(ContainElement(
+						garden.BindMount{
+							SrcPath: "/the/certs/volume/path",
+							DstPath: "/etc/ssl/certs",
+							Mode:    garden.BindMountModeRO,
+						},
+					))
+				})
+			})
+
+			BeforeEach(func() {
+				fakeCertsVolume := new(baggageclaimfakes.FakeVolume)
+				fakeCertsVolume.PathReturns("/the/certs/volume/path")
+				fakeBaggageclaimClient.LookupVolumeReturns(fakeCertsVolume, true, nil)
+			})
 
 			It("gets image", func() {
 				Expect(fakeImageFactory.GetImageCallCount()).To(Equal(1))
+				_, actualWorker, actualVolumeClient, actualImageSpec, actualTeamID, actualDelegate, actualResourceTypes := fakeImageFactory.GetImageArgsForCall(0)
+
+				Expect(actualWorker.GardenClient()).To(Equal(fakeGardenClient))
+
+				Expect(actualVolumeClient).To(Equal(fakeVolumeClient))
+				Expect(actualImageSpec).To(Equal(containerSpec.ImageSpec))
+				Expect(actualImageSpec).ToNot(BeZero())
+				Expect(actualTeamID).To(Equal(containerSpec.TeamID))
+				Expect(actualTeamID).ToNot(BeZero())
+				Expect(actualDelegate).To(Equal(fakeImageFetchingDelegate))
+				Expect(actualResourceTypes).To(Equal(resourceTypes))
+
 				Expect(fakeImage.FetchForContainerCallCount()).To(Equal(1))
+				actualCtx, _, actualContainer := fakeImage.FetchForContainerArgsForCall(0)
+				Expect(actualContainer).To(Equal(fakeCreatingContainer))
+				Expect(actualCtx).To(Equal(ctx))
+			})
+
+			It("creates container in database", func() {
+				Expect(fakeDBWorker.CreateContainerCallCount()).To(Equal(1))
 			})
 
 			It("acquires lock", func() {
 				Expect(fakeLockFactory.AcquireCallCount()).To(Equal(1))
 			})
 
-			It("creates container in garden", func() {
+			It("creates the container in garden with the input and output volumes in alphabetical order", func() {
 				Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+				actualSpec := fakeGardenClient.CreateArgsForCall(0)
+				Expect(actualSpec).To(Equal(garden.ContainerSpec{
+					Handle:     "some-handle",
+					RootFSPath: "some-image-url",
+					Properties: garden.Properties{"user": "some-user"},
+					BindMounts: []garden.BindMount{
+						{
+							SrcPath: "some/source",
+							DstPath: "some/destination",
+							Mode:    garden.BindMountModeRO,
+						},
+						{
+							SrcPath: "/fake/scratch/volume",
+							DstPath: "/scratch",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/work-dir/volume",
+							DstPath: "/some/work-dir",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/local/cow/volume",
+							DstPath: "/some/work-dir/local-input",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/output/volume",
+							DstPath: "/some/work-dir/output",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/remote/input/container/volume",
+							DstPath: "/some/work-dir/remote-input",
+							Mode:    garden.BindMountModeRW,
+						},
+					},
+					Limits: garden.Limits{
+						CPU:    garden.CPULimits{LimitInShares: 1024},
+						Memory: garden.MemoryLimits{LimitInBytes: 1024},
+					},
+					Env: []string{
+						"IMAGE=ENV",
+						"SOME=ENV",
+						"http_proxy=http://proxy.com",
+						"https_proxy=https://proxy.com",
+						"no_proxy=http://noproxy.com",
+					},
+				}))
+			})
+
+			Context("when the input and output destination paths overlap", func() {
+				var (
+					fakeRemoteInputUnderInput    *workerfakes.FakeInputSource
+					fakeRemoteInputUnderInputAS  *workerfakes.FakeArtifactSource
+					fakeRemoteInputUnderOutput   *workerfakes.FakeInputSource
+					fakeRemoteInputUnderOutputAS *workerfakes.FakeArtifactSource
+
+					fakeOutputUnderInputVolume                *workerfakes.FakeVolume
+					fakeOutputUnderOutputVolume               *workerfakes.FakeVolume
+					fakeRemoteInputUnderInputContainerVolume  *workerfakes.FakeVolume
+					fakeRemoteInputUnderOutputContainerVolume *workerfakes.FakeVolume
+				)
+
+				BeforeEach(func() {
+					fakeRemoteInputUnderInput = new(workerfakes.FakeInputSource)
+					fakeRemoteInputUnderInput.DestinationPathReturns("/some/work-dir/remote-input/other-input")
+					fakeRemoteInputUnderInputAS = new(workerfakes.FakeArtifactSource)
+					fakeRemoteInputUnderInputAS.VolumeOnReturns(nil, false, nil)
+					fakeRemoteInputUnderInput.SourceReturns(fakeRemoteInputUnderInputAS)
+
+					fakeRemoteInputUnderOutput = new(workerfakes.FakeInputSource)
+					fakeRemoteInputUnderOutput.DestinationPathReturns("/some/work-dir/output/input")
+					fakeRemoteInputUnderOutputAS = new(workerfakes.FakeArtifactSource)
+					fakeRemoteInputUnderOutputAS.VolumeOnReturns(nil, false, nil)
+					fakeRemoteInputUnderOutput.SourceReturns(fakeRemoteInputUnderOutputAS)
+
+					fakeOutputUnderInputVolume = new(workerfakes.FakeVolume)
+					fakeOutputUnderInputVolume.PathReturns("/fake/output/under/input/volume")
+					fakeOutputUnderOutputVolume = new(workerfakes.FakeVolume)
+					fakeOutputUnderOutputVolume.PathReturns("/fake/output/other-output/volume")
+
+					fakeRemoteInputUnderInputContainerVolume = new(workerfakes.FakeVolume)
+					fakeRemoteInputUnderInputContainerVolume.PathReturns("/fake/remote/input/other-input/container/volume")
+					fakeRemoteInputUnderOutputContainerVolume = new(workerfakes.FakeVolume)
+					fakeRemoteInputUnderOutputContainerVolume.PathReturns("/fake/output/input/container/volume")
+
+					stubbedVolumes["/some/work-dir/remote-input/other-input"] = fakeRemoteInputUnderInputContainerVolume
+					stubbedVolumes["/some/work-dir/output/input"] = fakeRemoteInputUnderOutputContainerVolume
+					stubbedVolumes["/some/work-dir/output/other-output"] = fakeOutputUnderOutputVolume
+					stubbedVolumes["/some/work-dir/local-input/output"] = fakeOutputUnderInputVolume
+				})
+
+				Context("outputs are nested under inputs", func() {
+					BeforeEach(func() {
+						containerSpec.Inputs = []InputSource{
+							fakeLocalInput,
+						}
+						containerSpec.Outputs = OutputPaths{
+							"some-output-under-input": "/some/work-dir/local-input/output",
+						}
+					})
+
+					It("creates the container with correct bind mounts", func() {
+						Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+						actualSpec := fakeGardenClient.CreateArgsForCall(0)
+						Expect(actualSpec).To(Equal(garden.ContainerSpec{
+							Handle:     "some-handle",
+							RootFSPath: "some-image-url",
+							Properties: garden.Properties{"user": "some-user"},
+							BindMounts: []garden.BindMount{
+								{
+									SrcPath: "some/source",
+									DstPath: "some/destination",
+									Mode:    garden.BindMountModeRO,
+								},
+								{
+									SrcPath: "/fake/scratch/volume",
+									DstPath: "/scratch",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/work-dir/volume",
+									DstPath: "/some/work-dir",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/local/cow/volume",
+									DstPath: "/some/work-dir/local-input",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/output/under/input/volume",
+									DstPath: "/some/work-dir/local-input/output",
+									Mode:    garden.BindMountModeRW,
+								},
+							},
+							Limits: garden.Limits{
+								CPU:    garden.CPULimits{LimitInShares: 1024},
+								Memory: garden.MemoryLimits{LimitInBytes: 1024},
+							},
+							Env: []string{
+								"IMAGE=ENV",
+								"SOME=ENV",
+								"http_proxy=http://proxy.com",
+								"https_proxy=https://proxy.com",
+								"no_proxy=http://noproxy.com",
+							},
+						}))
+					})
+				})
+
+				Context("inputs are nested under inputs", func() {
+					BeforeEach(func() {
+						containerSpec.Inputs = []InputSource{
+							fakeRemoteInput,
+							fakeRemoteInputUnderInput,
+						}
+						containerSpec.Outputs = OutputPaths{}
+					})
+
+					It("creates the container with correct bind mounts", func() {
+						Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+						actualSpec := fakeGardenClient.CreateArgsForCall(0)
+						Expect(actualSpec).To(Equal(garden.ContainerSpec{
+							Handle:     "some-handle",
+							RootFSPath: "some-image-url",
+							Properties: garden.Properties{"user": "some-user"},
+							BindMounts: []garden.BindMount{
+								{
+									SrcPath: "some/source",
+									DstPath: "some/destination",
+									Mode:    garden.BindMountModeRO,
+								},
+								{
+									SrcPath: "/fake/scratch/volume",
+									DstPath: "/scratch",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/work-dir/volume",
+									DstPath: "/some/work-dir",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/remote/input/container/volume",
+									DstPath: "/some/work-dir/remote-input",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/remote/input/other-input/container/volume",
+									DstPath: "/some/work-dir/remote-input/other-input",
+									Mode:    garden.BindMountModeRW,
+								},
+							},
+							Limits: garden.Limits{
+								CPU:    garden.CPULimits{LimitInShares: 1024},
+								Memory: garden.MemoryLimits{LimitInBytes: 1024},
+							},
+							Env: []string{
+								"IMAGE=ENV",
+								"SOME=ENV",
+								"http_proxy=http://proxy.com",
+								"https_proxy=https://proxy.com",
+								"no_proxy=http://noproxy.com",
+							},
+						}))
+					})
+				})
+
+				Context("outputs are nested under outputs", func() {
+					BeforeEach(func() {
+						containerSpec.Inputs = []InputSource{}
+						containerSpec.Outputs = OutputPaths{
+							"some-output":              "/some/work-dir/output",
+							"some-output-under-output": "/some/work-dir/output/other-output",
+						}
+					})
+
+					It("creates the container with correct bind mounts", func() {
+						Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+						actualSpec := fakeGardenClient.CreateArgsForCall(0)
+						Expect(actualSpec).To(Equal(garden.ContainerSpec{
+							Handle:     "some-handle",
+							RootFSPath: "some-image-url",
+							Properties: garden.Properties{"user": "some-user"},
+							BindMounts: []garden.BindMount{
+								{
+									SrcPath: "some/source",
+									DstPath: "some/destination",
+									Mode:    garden.BindMountModeRO,
+								},
+								{
+									SrcPath: "/fake/scratch/volume",
+									DstPath: "/scratch",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/work-dir/volume",
+									DstPath: "/some/work-dir",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/output/volume",
+									DstPath: "/some/work-dir/output",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/output/other-output/volume",
+									DstPath: "/some/work-dir/output/other-output",
+									Mode:    garden.BindMountModeRW,
+								},
+							},
+							Limits: garden.Limits{
+								CPU:    garden.CPULimits{LimitInShares: 1024},
+								Memory: garden.MemoryLimits{LimitInBytes: 1024},
+							},
+							Env: []string{
+								"IMAGE=ENV",
+								"SOME=ENV",
+								"http_proxy=http://proxy.com",
+								"https_proxy=https://proxy.com",
+								"no_proxy=http://noproxy.com",
+							},
+						}))
+					})
+				})
+
+				Context("inputs are nested under outputs", func() {
+					BeforeEach(func() {
+						containerSpec.Inputs = []InputSource{
+							fakeRemoteInputUnderOutput,
+						}
+						containerSpec.Outputs = OutputPaths{
+							"some-output": "/some/work-dir/output",
+						}
+					})
+
+					It("creates the container with correct bind mounts", func() {
+						Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+						actualSpec := fakeGardenClient.CreateArgsForCall(0)
+						Expect(actualSpec).To(Equal(garden.ContainerSpec{
+							Handle:     "some-handle",
+							RootFSPath: "some-image-url",
+							Properties: garden.Properties{"user": "some-user"},
+							BindMounts: []garden.BindMount{
+								{
+									SrcPath: "some/source",
+									DstPath: "some/destination",
+									Mode:    garden.BindMountModeRO,
+								},
+								{
+									SrcPath: "/fake/scratch/volume",
+									DstPath: "/scratch",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/work-dir/volume",
+									DstPath: "/some/work-dir",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/output/volume",
+									DstPath: "/some/work-dir/output",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/output/input/container/volume",
+									DstPath: "/some/work-dir/output/input",
+									Mode:    garden.BindMountModeRW,
+								},
+							},
+							Limits: garden.Limits{
+								CPU:    garden.CPULimits{LimitInShares: 1024},
+								Memory: garden.MemoryLimits{LimitInBytes: 1024},
+							},
+							Env: []string{
+								"IMAGE=ENV",
+								"SOME=ENV",
+								"http_proxy=http://proxy.com",
+								"https_proxy=https://proxy.com",
+								"no_proxy=http://noproxy.com",
+							},
+						}))
+
+					})
+				})
+
+				Context("input and output share the same destination path", func() {
+					BeforeEach(func() {
+						containerSpec.Inputs = []InputSource{
+							fakeRemoteInput,
+						}
+						containerSpec.Outputs = OutputPaths{
+							"some-output": "/some/work-dir/remote-input",
+						}
+					})
+
+					It("creates the container with correct bind mounts", func() {
+						Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+						actualSpec := fakeGardenClient.CreateArgsForCall(0)
+						Expect(actualSpec).To(Equal(garden.ContainerSpec{
+							Handle:     "some-handle",
+							RootFSPath: "some-image-url",
+							Properties: garden.Properties{"user": "some-user"},
+							BindMounts: []garden.BindMount{
+								{
+									SrcPath: "some/source",
+									DstPath: "some/destination",
+									Mode:    garden.BindMountModeRO,
+								},
+								{
+									SrcPath: "/fake/scratch/volume",
+									DstPath: "/scratch",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/work-dir/volume",
+									DstPath: "/some/work-dir",
+									Mode:    garden.BindMountModeRW,
+								},
+								{
+									SrcPath: "/fake/remote/input/container/volume",
+									DstPath: "/some/work-dir/remote-input",
+									Mode:    garden.BindMountModeRW,
+								},
+							},
+							Limits: garden.Limits{
+								CPU:    garden.CPULimits{LimitInShares: 1024},
+								Memory: garden.MemoryLimits{LimitInBytes: 1024},
+							},
+							Env: []string{
+								"IMAGE=ENV",
+								"SOME=ENV",
+								"http_proxy=http://proxy.com",
+								"https_proxy=https://proxy.com",
+								"no_proxy=http://noproxy.com",
+							},
+						}))
+					})
+
+				})
+			})
+
+			It("creates each volume unprivileged", func() {
+				Expect(volumeSpecs).To(Equal(map[string]VolumeSpec{
+					"/scratch":                    VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
+					"/some/work-dir":              VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
+					"/some/work-dir/output":       VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
+					"/some/work-dir/local-input":  VolumeSpec{Strategy: fakeLocalVolume.COWStrategy()},
+					"/some/work-dir/remote-input": VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
+				}))
+			})
+
+			It("streams remote inputs into newly created container volumes", func() {
+				Expect(fakeRemoteInputAS.StreamToCallCount()).To(Equal(1))
+				_, ad := fakeRemoteInputAS.StreamToArgsForCall(0)
+
+				err := ad.StreamIn(".", bytes.NewBufferString("some-stream"))
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(fakeRemoteInputContainerVolume.StreamInCallCount()).To(Equal(1))
+
+				dst, from := fakeRemoteInputContainerVolume.StreamInArgsForCall(0)
+				Expect(dst).To(Equal("."))
+				Expect(ioutil.ReadAll(from)).To(Equal([]byte("some-stream")))
 			})
 
 			It("marks container as created", func() {
 				Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(1))
 			})
 
-			It("returns worker container", func() {
-				Expect(findOrCreateContainer).ToNot(BeNil())
+			Context("when the fetched image was privileged", func() {
+				BeforeEach(func() {
+					fakeImage.FetchForContainerReturns(FetchedImage{
+						Privileged: true,
+						Metadata: ImageMetadata{
+							Env: []string{"IMAGE=ENV"},
+						},
+						URL: "some-image-url",
+					}, nil)
+				})
+
+				It("creates the container privileged", func() {
+					Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+					actualSpec := fakeGardenClient.CreateArgsForCall(0)
+					Expect(actualSpec.Privileged).To(BeTrue())
+				})
+
+				It("creates each volume privileged", func() {
+					Expect(volumeSpecs).To(Equal(map[string]VolumeSpec{
+						"/scratch":                    VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
+						"/some/work-dir":              VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
+						"/some/work-dir/output":       VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
+						"/some/work-dir/local-input":  VolumeSpec{Privileged: true, Strategy: fakeLocalVolume.COWStrategy()},
+						"/some/work-dir/remote-input": VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
+					}))
+				})
+
+			})
+
+			Context("when an input has the path set to the workdir itself", func() {
+				BeforeEach(func() {
+					fakeLocalInput.DestinationPathReturns("/some/work-dir")
+					delete(stubbedVolumes, "/some/work-dir/local-input")
+					stubbedVolumes["/some/work-dir"] = fakeLocalCOWVolume
+				})
+
+				It("does not create or mount a work-dir, as we support this for backwards-compatibility", func() {
+					Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
+
+					actualSpec := fakeGardenClient.CreateArgsForCall(0)
+					Expect(actualSpec.BindMounts).To(Equal([]garden.BindMount{
+						{
+							SrcPath: "some/source",
+							DstPath: "some/destination",
+							Mode:    garden.BindMountModeRO,
+						},
+						{
+							SrcPath: "/fake/scratch/volume",
+							DstPath: "/scratch",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/local/cow/volume",
+							DstPath: "/some/work-dir",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/output/volume",
+							DstPath: "/some/work-dir/output",
+							Mode:    garden.BindMountModeRW,
+						},
+						{
+							SrcPath: "/fake/remote/input/container/volume",
+							DstPath: "/some/work-dir/remote-input",
+							Mode:    garden.BindMountModeRW,
+						},
+					}))
+				})
+			})
+
+			Context("when getting image fails", func() {
+				BeforeEach(func() {
+					fakeImageFactory.GetImageReturns(nil, disasterErr)
+				})
+
+				It("returns an error", func() {
+					Expect(findOrCreateErr).To(Equal(disasterErr))
+				})
+
+				It("does not create container in database", func() {
+					Expect(fakeDBWorker.CreateContainerCallCount()).To(Equal(0))
+				})
+
+				It("does not create container in garden", func() {
+					Expect(fakeGardenClient.CreateCallCount()).To(Equal(0))
+				})
 			})
 
 			Context("when failing to create container in garden", func() {
@@ -315,332 +965,10 @@ var _ = Describe("ContainerProvider", func() {
 				It("does not mark container as created", func() {
 					Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(0))
 				})
-			})
 
-			Context("when getting image fails", func() {
-				BeforeEach(func() {
-					fakeImageFactory.GetImageReturns(nil, disasterErr)
+				It("marks the container as failed", func() {
+					Expect(fakeCreatingContainer.FailedCallCount()).To(Equal(1))
 				})
-
-				It("returns an error", func() {
-					Expect(findOrCreateErr).To(Equal(disasterErr))
-				})
-
-				It("does not create container in garden", func() {
-					Expect(fakeGardenClient.CreateCallCount()).To(Equal(0))
-				})
-			})
-		})
-	}
-
-	ItHandlesContainerInCreatedState := func() {
-		Context("when container exists in garden", func() {
-			BeforeEach(func() {
-				fakeGardenClient.LookupReturns(fakeGardenContainer, nil)
-			})
-
-			It("returns container", func() {
-				Expect(findOrCreateContainer).ToNot(BeNil())
-			})
-		})
-
-		Context("when container does not exist in garden", func() {
-			var containerNotFoundErr error
-
-			BeforeEach(func() {
-				containerNotFoundErr = garden.ContainerNotFoundError{}
-				fakeGardenClient.LookupReturns(nil, containerNotFoundErr)
-			})
-
-			It("returns an error", func() {
-				Expect(findOrCreateErr).To(Equal(containerNotFoundErr))
-			})
-		})
-	}
-
-	ItHandlesNonExistentContainer := func(createDatabaseCallCountFunc func() int) {
-		Context("when the certs volume does not exist on the worker", func() {
-			BeforeEach(func() {
-				fakeBaggageclaimClient.LookupVolumeReturns(nil, false, nil)
-			})
-			It("creates the container in garden, but does not bind mount any certs", func() {
-				Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
-				actualSpec := fakeGardenClient.CreateArgsForCall(0)
-				Expect(actualSpec.BindMounts).ToNot(ContainElement(
-					garden.BindMount{
-						SrcPath: "/the/certs/volume/path",
-						DstPath: "/etc/ssl/certs",
-						Mode:    garden.BindMountModeRO,
-					},
-				))
-			})
-		})
-
-		BeforeEach(func() {
-			fakeCertsVolume := new(baggageclaimfakes.FakeVolume)
-			fakeCertsVolume.PathReturns("/the/certs/volume/path")
-			fakeBaggageclaimClient.LookupVolumeReturns(fakeCertsVolume, true, nil)
-		})
-
-		It("gets image", func() {
-			Expect(fakeImageFactory.GetImageCallCount()).To(Equal(1))
-			_, actualWorker, actualVolumeClient, actualImageSpec, actualTeamID, actualDelegate, actualResourceTypes := fakeImageFactory.GetImageArgsForCall(0)
-
-			Expect(actualWorker.GardenClient()).To(Equal(fakeGardenClient))
-
-			Expect(actualVolumeClient).To(Equal(fakeVolumeClient))
-			Expect(actualImageSpec).To(Equal(containerSpec.ImageSpec))
-			Expect(actualImageSpec).ToNot(BeZero())
-			Expect(actualTeamID).To(Equal(containerSpec.TeamID))
-			Expect(actualTeamID).ToNot(BeZero())
-			Expect(actualDelegate).To(Equal(fakeImageFetchingDelegate))
-			Expect(actualResourceTypes).To(Equal(resourceTypes))
-
-			Expect(fakeImage.FetchForContainerCallCount()).To(Equal(1))
-			actualCtx, _, actualContainer := fakeImage.FetchForContainerArgsForCall(0)
-			Expect(actualContainer).To(Equal(fakeCreatingContainer))
-			Expect(actualCtx).To(Equal(ctx))
-		})
-
-		It("creates container in database", func() {
-			Expect(createDatabaseCallCountFunc()).To(Equal(1))
-		})
-
-		It("acquires lock", func() {
-			Expect(fakeLockFactory.AcquireCallCount()).To(Equal(1))
-		})
-
-		It("creates the container in garden", func() {
-			Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
-
-			actualSpec := fakeGardenClient.CreateArgsForCall(0)
-			Expect(actualSpec).To(Equal(garden.ContainerSpec{
-				Handle:     "some-handle",
-				RootFSPath: "some-image-url",
-				Properties: garden.Properties{"user": "some-user"},
-				BindMounts: []garden.BindMount{
-					{
-						SrcPath: "some/source",
-						DstPath: "some/destination",
-						Mode:    garden.BindMountModeRO,
-					},
-					{
-						SrcPath: "/fake/scratch/volume",
-						DstPath: "/scratch",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/work-dir/volume",
-						DstPath: "/some/work-dir",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/local/cow/volume",
-						DstPath: "/some/work-dir/local-input",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/remote/input/container/volume",
-						DstPath: "/some/work-dir/remote-input",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/output/volume",
-						DstPath: "/some/work-dir/output",
-						Mode:    garden.BindMountModeRW,
-					},
-				},
-				Limits: garden.Limits{
-					CPU:    garden.CPULimits{LimitInShares: 1024},
-					Memory: garden.MemoryLimits{LimitInBytes: 1024},
-				},
-				Env: []string{
-					"IMAGE=ENV",
-					"SOME=ENV",
-					"http_proxy=http://proxy.com",
-					"https_proxy=https://proxy.com",
-					"no_proxy=http://noproxy.com",
-				},
-			}))
-		})
-
-		It("creates each volume unprivileged", func() {
-			Expect(volumeSpecs).To(Equal(map[string]VolumeSpec{
-				"/scratch":                    VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
-				"/some/work-dir":              VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
-				"/some/work-dir/output":       VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
-				"/some/work-dir/local-input":  VolumeSpec{Strategy: fakeLocalVolume.COWStrategy()},
-				"/some/work-dir/remote-input": VolumeSpec{Strategy: baggageclaim.EmptyStrategy{}},
-			}))
-		})
-
-		It("streams remote inputs into newly created container volumes", func() {
-			Expect(fakeRemoteInputAS.StreamToCallCount()).To(Equal(1))
-			ad := fakeRemoteInputAS.StreamToArgsForCall(0)
-
-			err := ad.StreamIn(".", bytes.NewBufferString("some-stream"))
-			Expect(err).ToNot(HaveOccurred())
-
-			Expect(fakeRemoteInputContainerVolume.StreamInCallCount()).To(Equal(1))
-
-			dst, from := fakeRemoteInputContainerVolume.StreamInArgsForCall(0)
-			Expect(dst).To(Equal("."))
-			Expect(ioutil.ReadAll(from)).To(Equal([]byte("some-stream")))
-		})
-
-		It("marks container as created", func() {
-			Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(1))
-		})
-
-		Context("when the fetched image was privileged", func() {
-			BeforeEach(func() {
-				fakeImage.FetchForContainerReturns(FetchedImage{
-					Privileged: true,
-					Metadata: ImageMetadata{
-						Env: []string{"IMAGE=ENV"},
-					},
-					URL: "some-image-url",
-				}, nil)
-			})
-
-			It("creates the container privileged", func() {
-				Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
-
-				actualSpec := fakeGardenClient.CreateArgsForCall(0)
-				Expect(actualSpec.Privileged).To(BeTrue())
-			})
-
-			It("creates each volume privileged", func() {
-				Expect(volumeSpecs).To(Equal(map[string]VolumeSpec{
-					"/scratch":                    VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
-					"/some/work-dir":              VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
-					"/some/work-dir/output":       VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
-					"/some/work-dir/local-input":  VolumeSpec{Privileged: true, Strategy: fakeLocalVolume.COWStrategy()},
-					"/some/work-dir/remote-input": VolumeSpec{Privileged: true, Strategy: baggageclaim.EmptyStrategy{}},
-				}))
-			})
-
-		})
-
-		Context("when an input has the path set to the workdir itself", func() {
-			BeforeEach(func() {
-				fakeLocalInput.DestinationPathReturns("/some/work-dir")
-				delete(stubbedVolumes, "/some/work-dir/local-input")
-				stubbedVolumes["/some/work-dir"] = fakeLocalCOWVolume
-			})
-
-			It("does not create or mount a work-dir, as we support this for backwards-compatibility", func() {
-				Expect(fakeGardenClient.CreateCallCount()).To(Equal(1))
-
-				actualSpec := fakeGardenClient.CreateArgsForCall(0)
-				Expect(actualSpec.BindMounts).To(Equal([]garden.BindMount{
-					{
-						SrcPath: "some/source",
-						DstPath: "some/destination",
-						Mode:    garden.BindMountModeRO,
-					},
-					{
-						SrcPath: "/fake/scratch/volume",
-						DstPath: "/scratch",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/local/cow/volume",
-						DstPath: "/some/work-dir",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/remote/input/container/volume",
-						DstPath: "/some/work-dir/remote-input",
-						Mode:    garden.BindMountModeRW,
-					},
-					{
-						SrcPath: "/fake/output/volume",
-						DstPath: "/some/work-dir/output",
-						Mode:    garden.BindMountModeRW,
-					},
-				}))
-			})
-		})
-
-		Context("when getting image fails", func() {
-			BeforeEach(func() {
-				fakeImageFactory.GetImageReturns(nil, disasterErr)
-			})
-
-			It("returns an error", func() {
-				Expect(findOrCreateErr).To(Equal(disasterErr))
-			})
-
-			It("does not create container in database", func() {
-				Expect(createDatabaseCallCountFunc()).To(Equal(0))
-			})
-
-			It("does not create container in garden", func() {
-				Expect(fakeGardenClient.CreateCallCount()).To(Equal(0))
-			})
-		})
-
-		Context("when failing to create container in garden", func() {
-			BeforeEach(func() {
-				fakeGardenClient.CreateReturns(nil, disasterErr)
-			})
-
-			It("returns an error", func() {
-				Expect(findOrCreateErr).To(Equal(disasterErr))
-			})
-
-			It("does not mark container as created", func() {
-				Expect(fakeCreatingContainer.CreatedCallCount()).To(Equal(0))
-			})
-
-			It("marks the container as failed", func() {
-				Expect(fakeCreatingContainer.FailedCallCount()).To(Equal(1))
-			})
-		})
-	}
-
-	Describe("FindOrCreateContainer", func() {
-		BeforeEach(func() {
-			fakeDBTeam.CreateContainerReturns(fakeCreatingContainer, nil)
-			fakeLockFactory.AcquireReturns(new(lockfakes.FakeLock), true, nil)
-		})
-
-		JustBeforeEach(func() {
-			findOrCreateContainer, findOrCreateErr = containerProvider.FindOrCreateContainer(
-				ctx,
-				logger,
-				fakeContainerOwner,
-				fakeImageFetchingDelegate,
-				containerMetadata,
-				containerSpec,
-				resourceTypes,
-			)
-		})
-
-		Context("when container exists in database in creating state", func() {
-			BeforeEach(func() {
-				fakeDBTeam.FindContainerOnWorkerReturns(fakeCreatingContainer, nil, nil)
-			})
-
-			ItHandlesContainerInCreatingState()
-		})
-
-		Context("when container exists in database in created state", func() {
-			BeforeEach(func() {
-				fakeDBTeam.FindContainerOnWorkerReturns(nil, fakeCreatedContainer, nil)
-			})
-
-			ItHandlesContainerInCreatedState()
-		})
-
-		Context("when container does not exist in database", func() {
-			BeforeEach(func() {
-				fakeDBTeam.FindContainerOnWorkerReturns(nil, nil, nil)
-			})
-
-			ItHandlesNonExistentContainer(func() int {
-				return fakeDBTeam.CreateContainerCallCount()
 			})
 		})
 	})
@@ -852,7 +1180,5 @@ var _ = Describe("ContainerProvider", func() {
 				Expect(foundContainer).To(BeNil())
 			})
 		})
-
 	})
-
 })

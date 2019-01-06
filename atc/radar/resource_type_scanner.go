@@ -15,32 +15,32 @@ import (
 )
 
 type resourceTypeScanner struct {
-	clock                             clock.Clock
-	resourceFactory                   resource.ResourceFactory
-	resourceConfigCheckSessionFactory db.ResourceConfigCheckSessionFactory
-	defaultInterval                   time.Duration
-	dbPipeline                        db.Pipeline
-	externalURL                       string
-	variables                         creds.Variables
+	clock                 clock.Clock
+	resourceFactory       resource.ResourceFactory
+	resourceConfigFactory db.ResourceConfigFactory
+	defaultInterval       time.Duration
+	dbPipeline            db.Pipeline
+	externalURL           string
+	variables             creds.Variables
 }
 
 func NewResourceTypeScanner(
 	clock clock.Clock,
 	resourceFactory resource.ResourceFactory,
-	resourceConfigCheckSessionFactory db.ResourceConfigCheckSessionFactory,
+	resourceConfigFactory db.ResourceConfigFactory,
 	defaultInterval time.Duration,
 	dbPipeline db.Pipeline,
 	externalURL string,
 	variables creds.Variables,
 ) Scanner {
 	return &resourceTypeScanner{
-		clock:                             clock,
-		resourceFactory:                   resourceFactory,
-		resourceConfigCheckSessionFactory: resourceConfigCheckSessionFactory,
-		defaultInterval:                   defaultInterval,
-		dbPipeline:                        dbPipeline,
-		externalURL:                       externalURL,
-		variables:                         variables,
+		clock:                 clock,
+		resourceFactory:       resourceFactory,
+		resourceConfigFactory: resourceConfigFactory,
+		defaultInterval:       defaultInterval,
+		dbPipeline:            dbPipeline,
+		externalURL:           externalURL,
+		variables:             variables,
 	}
 }
 
@@ -75,6 +75,7 @@ func (scanner *resourceTypeScanner) scan(logger lager.Logger, resourceTypeName s
 
 	interval, err := scanner.checkInterval(savedResourceType.CheckEvery())
 	if err != nil {
+		scanner.setCheckError(logger, savedResourceType, err)
 		return 0, err
 	}
 
@@ -97,6 +98,7 @@ func (scanner *resourceTypeScanner) scan(logger lager.Logger, resourceTypeName s
 
 		if err = scanner.Scan(logger, parentType.Name()); err != nil {
 			logger.Error("failed-to-scan-parent-resource-type-version", err)
+			scanner.setCheckError(logger, savedResourceType, err)
 			return 0, err
 		}
 	}
@@ -115,38 +117,36 @@ func (scanner *resourceTypeScanner) scan(logger lager.Logger, resourceTypeName s
 	source, err := creds.NewSource(scanner.variables, savedResourceType.Source()).Evaluate()
 	if err != nil {
 		logger.Error("failed-to-evaluate-resource-type-source", err)
+		scanner.setCheckError(logger, savedResourceType, err)
 		return 0, err
 	}
 
-	resourceConfigCheckSession, err := scanner.resourceConfigCheckSessionFactory.FindOrCreateResourceConfigCheckSession(
+	resourceConfig, err := savedResourceType.SetResourceConfig(
 		logger,
-		savedResourceType.Type(),
 		source,
 		versionedResourceTypes.Without(savedResourceType.Name()),
-		ContainerExpiries,
 	)
 	if err != nil {
-		logger.Error("failed-to-find-or-create-resource-config", err)
-		return 0, err
-	}
-
-	err = savedResourceType.SetResourceConfig(resourceConfigCheckSession.ResourceConfig().ID())
-	if err != nil {
 		logger.Error("failed-to-set-resource-config-id-on-resource-type", err)
+		scanner.setCheckError(logger, savedResourceType, err)
 		return 0, err
 	}
 
-	for breaker := true; breaker == true; breaker = mustComplete {
-		lock, acquired, err := scanner.dbPipeline.AcquireResourceTypeCheckingLockWithIntervalCheck(
+	// Clear out the check error on the resource type
+	scanner.setCheckError(logger, savedResourceType, err)
+
+	reattempt := true
+	for reattempt {
+		reattempt = mustComplete
+		lock, acquired, err := resourceConfig.AcquireResourceConfigCheckingLockWithIntervalCheck(
 			logger,
-			savedResourceType.Name(),
-			resourceConfigCheckSession.ResourceConfig(),
 			interval,
 			mustComplete,
 		)
 		if err != nil {
 			lockLogger.Error("failed-to-get-lock", err, lager.Data{
-				"resource-type": resourceTypeName,
+				"resource-type":      resourceTypeName,
+				"resource-config-id": resourceConfig.ID(),
 			})
 			return interval, ErrFailedToAcquireLock
 		}
@@ -167,13 +167,21 @@ func (scanner *resourceTypeScanner) scan(logger lager.Logger, resourceTypeName s
 	}
 
 	if fromVersion == nil {
-		fromVersion = atc.Version(savedResourceType.Version())
+		rcv, found, err := resourceConfig.LatestVersion()
+		if err != nil {
+			logger.Error("failed-to-get-current-version", err)
+			return interval, err
+		}
+
+		if found {
+			fromVersion = atc.Version(rcv.Version())
+		}
 	}
 
 	return interval, scanner.check(
 		logger,
 		savedResourceType,
-		resourceConfigCheckSession,
+		resourceConfig,
 		fromVersion,
 		versionedResourceTypes,
 		source,
@@ -184,7 +192,7 @@ func (scanner *resourceTypeScanner) scan(logger lager.Logger, resourceTypeName s
 func (scanner *resourceTypeScanner) check(
 	logger lager.Logger,
 	savedResourceType db.ResourceType,
-	resourceConfigCheckSession db.ResourceConfigCheckSession,
+	resourceConfig db.ResourceConfig,
 	fromVersion atc.Version,
 	versionedResourceTypes creds.VersionedResourceTypes,
 	source atc.Source,
@@ -201,7 +209,7 @@ func (scanner *resourceTypeScanner) check(
 		return nil
 	}
 
-	resourceSpec := worker.ContainerSpec{
+	containerSpec := worker.ContainerSpec{
 		ImageSpec: worker.ImageSpec{
 			ResourceType: savedResourceType.Type(),
 		},
@@ -209,23 +217,41 @@ func (scanner *resourceTypeScanner) check(
 		TeamID: scanner.dbPipeline.TeamID(),
 	}
 
+	workerSpec := worker.WorkerSpec{
+		ResourceType:  savedResourceType.Type(),
+		Tags:          savedResourceType.Tags(),
+		ResourceTypes: versionedResourceTypes.Without(savedResourceType.Name()),
+	}
+
 	res, err := scanner.resourceFactory.NewResource(
 		context.Background(),
 		logger,
-		db.NewResourceConfigCheckSessionContainerOwner(resourceConfigCheckSession, scanner.dbPipeline.TeamID()),
+		db.NewResourceConfigCheckSessionContainerOwner(resourceConfig, ContainerExpiries),
 		db.ContainerMetadata{
 			Type: db.ContainerTypeCheck,
 		},
-		resourceSpec,
+		containerSpec,
+		workerSpec,
 		versionedResourceTypes.Without(savedResourceType.Name()),
 		worker.NoopImageFetchingDelegate{},
 	)
 	if err != nil {
 		logger.Error("failed-to-initialize-new-container", err)
+
+		if err == worker.ErrNoGlobalWorkers {
+			err = atc.ErrNoWorkers
+		}
+
+		chkErr := resourceConfig.SetCheckError(err)
+		if chkErr != nil {
+			logger.Error("failed-to-set-check-error-on-resource-config", chkErr)
+		}
+
 		return err
 	}
 
 	newVersions, err := res.Check(context.TODO(), source, fromVersion)
+	resourceConfig.SetCheckError(err)
 	if err != nil {
 		if rErr, ok := err.(resource.ErrResourceScriptFailed); ok {
 			logger.Info("check-failed", lager.Data{"exit-status": rErr.ExitStatus})
@@ -246,11 +272,10 @@ func (scanner *resourceTypeScanner) check(
 		"total":    len(newVersions),
 	})
 
-	version := newVersions[len(newVersions)-1]
-	err = savedResourceType.SaveVersion(version)
+	err = resourceConfig.SaveVersions(newVersions)
 	if err != nil {
-		logger.Error("failed-to-save-resource-type-version", err, lager.Data{
-			"version": version,
+		logger.Error("failed-to-save-resource-config-versions", err, lager.Data{
+			"versions": newVersions,
 		})
 		return err
 	}
@@ -270,4 +295,11 @@ func (scanner *resourceTypeScanner) checkInterval(checkEvery string) (time.Durat
 	}
 
 	return interval, nil
+}
+
+func (scanner *resourceTypeScanner) setCheckError(logger lager.Logger, savedResourceType db.ResourceType, err error) {
+	setErr := savedResourceType.SetCheckError(err)
+	if setErr != nil {
+		logger.Error("failed-to-set-check-error", err)
+	}
 }

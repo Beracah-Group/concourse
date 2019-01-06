@@ -9,13 +9,11 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/lager"
-
 	sq "github.com/Masterminds/squirrel"
 	"github.com/concourse/concourse/atc"
 	"github.com/concourse/concourse/atc/creds"
 	"github.com/concourse/concourse/atc/db/lock"
 	"github.com/lib/pq"
-	uuid "github.com/nu7hatch/gouuid"
 )
 
 var ErrConfigComparisonFailed = errors.New("comparison with existing config failed during save")
@@ -48,21 +46,19 @@ type Team interface {
 	CreateOneOffBuild() (Build, error)
 	PrivateAndPublicBuilds(Page) ([]Build, Pagination, error)
 	Builds(page Page) ([]Build, Pagination, error)
+	BuildsWithTime(page Page) ([]Build, Pagination, error)
 
 	SaveWorker(atcWorker atc.Worker, ttl time.Duration) (Worker, error)
 	Workers() ([]Worker, error)
 
+	Containers(lager.Logger) ([]Container, error)
+	IsCheckContainer(string) (bool, error)
+	IsContainerWithinTeam(string, bool) (bool, error)
 	FindContainerByHandle(string) (Container, bool, error)
+	FindCheckContainers(lager.Logger, string, string, creds.VariablesFactory) ([]Container, map[int]time.Time, error)
 	FindContainersByMetadata(ContainerMetadata) ([]Container, error)
-	FindCheckContainers(lager.Logger, string, string, creds.VariablesFactory) ([]Container, error)
-
 	FindCreatedContainerByHandle(string) (CreatedContainer, bool, error)
-
 	FindWorkerForContainer(handle string) (Worker, bool, error)
-
-	FindWorkerForContainerByOwner(ContainerOwner) (Worker, bool, error)
-	FindContainerOnWorker(workerName string, owner ContainerOwner) (CreatingContainer, CreatedContainer, error)
-	CreateContainer(workerName string, owner ContainerOwner, meta ContainerMetadata) (CreatingContainer, error)
 
 	UpdateProviderAuth(auth atc.TeamAuth) error
 }
@@ -117,106 +113,123 @@ func (t *team) Workers() ([]Worker, error) {
 func (t *team) FindWorkerForContainer(handle string) (Worker, bool, error) {
 	return getWorker(t.conn, workersQuery.Join("containers c ON c.worker_name = w.name").Where(sq.And{
 		sq.Eq{"c.handle": handle},
-		sq.Eq{"c.team_id": t.id},
 	}))
 }
 
-func (t *team) FindWorkerForContainerByOwner(owner ContainerOwner) (Worker, bool, error) {
-	ownerQuery, found, err := owner.Find(t.conn)
+func (t *team) Containers(
+	logger lager.Logger,
+) ([]Container, error) {
+	rows, err := selectContainers("c").
+		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
+		Join("resources r ON r.resource_config_id = rccs.resource_config_id").
+		Join("pipelines p ON p.id = r.pipeline_id").
+		Where(sq.Eq{
+			"p.team_id": t.id,
+		}).
+		Distinct().
+		RunWith(t.conn).
+		Query()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	if !found {
-		return nil, false, nil
+	var containers []Container
+	containers, err = scanContainers(rows, t.conn, containers)
+	if err != nil {
+		return nil, err
 	}
 
-	ownerEq := sq.Eq{}
-	for k, v := range ownerQuery {
-		ownerEq["c."+k] = v
+	rows, err = selectContainers("c").
+		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
+		Join("resource_types rt ON rt.resource_config_id = rccs.resource_config_id").
+		Join("pipelines p ON p.id = rt.pipeline_id").
+		Where(sq.Eq{
+			"p.team_id": t.id,
+		}).
+		Distinct().
+		RunWith(t.conn).
+		Query()
+	if err != nil {
+		return nil, err
 	}
 
-	return getWorker(t.conn, workersQuery.Join("containers c ON c.worker_name = w.name").Where(sq.And{
-		sq.Eq{"c.team_id": t.id},
-		ownerEq,
-	}))
+	containers, err = scanContainers(rows, t.conn, containers)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err = selectContainers("c").
+		Where(sq.Eq{
+			"c.team_id": t.id,
+		}).
+		RunWith(t.conn).
+		Query()
+	if err != nil {
+		return nil, err
+	}
+
+	containers, err = scanContainers(rows, t.conn, containers)
+	if err != nil {
+		return nil, err
+	}
+
+	return containers, nil
 }
 
-func (t *team) FindContainerOnWorker(workerName string, owner ContainerOwner) (CreatingContainer, CreatedContainer, error) {
-	ownerQuery, found, err := owner.Find(t.conn)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if !found {
-		return nil, nil, nil
-	}
-
-	return t.findContainer(sq.And{
-		sq.Eq{"worker_name": workerName},
-		ownerQuery,
-	})
-}
-
-func (t *team) CreateContainer(workerName string, owner ContainerOwner, meta ContainerMetadata) (CreatingContainer, error) {
-	handle, err := uuid.NewV4()
-	if err != nil {
-		return nil, err
-	}
-
-	var containerID int
-	cols := []interface{}{&containerID}
-
-	metadata := &ContainerMetadata{}
-	cols = append(cols, metadata.ScanTargets()...)
-
-	tx, err := t.conn.Begin()
-	if err != nil {
-		return nil, err
-	}
-
-	defer Rollback(tx)
-
-	insMap := meta.SQLMap()
-	insMap["worker_name"] = workerName
-	insMap["handle"] = handle.String()
-	insMap["team_id"] = t.id
-
-	ownerCols, err := owner.Create(tx, workerName)
-	if err != nil {
-		return nil, err
-	}
-
-	for k, v := range ownerCols {
-		insMap[k] = v
-	}
-
-	err = psql.Insert("containers").
-		SetMap(insMap).
-		Suffix("RETURNING id, " + strings.Join(containerMetadataColumns, ", ")).
-		RunWith(tx).
+func (t *team) IsCheckContainer(handle string) (bool, error) {
+	var containerType string
+	err := psql.Select("meta_type").
+		From("containers").
+		Where(sq.Eq{
+			"handle": handle,
+		}).
+		RunWith(t.conn).
 		QueryRow().
-		Scan(cols...)
+		Scan(&containerType)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code.Name() == pqFKeyViolationErrCode {
-			return nil, ErrBuildDisappeared
+		return false, err
+	}
+
+	return ContainerType(containerType) == ContainerTypeCheck, nil
+}
+
+func (t *team) IsContainerWithinTeam(handle string, isCheck bool) (bool, error) {
+	var ok int
+	var err error
+
+	if isCheck {
+		err = psql.Select("1").
+			From("resources r").
+			Join("pipelines p ON p.id = r.pipeline_id").
+			Join("resource_configs rc ON rc.id = r.resource_config_id").
+			Join("resource_config_check_sessions rccs ON rccs.resource_config_id = rc.id").
+			Join("containers c ON rccs.id = c.resource_config_check_session_id").
+			Where(sq.Eq{
+				"c.handle":  handle,
+				"p.team_id": t.id,
+			}).
+			RunWith(t.conn).
+			QueryRow().
+			Scan(&ok)
+	} else {
+		err = psql.Select("1").
+			From("containers c").
+			Where(sq.Eq{
+				"c.team_id": t.id,
+				"c.handle":  handle,
+			}).
+			RunWith(t.conn).
+			QueryRow().
+			Scan(&ok)
+	}
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
 		}
-
-		return nil, err
+		return false, err
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		return nil, err
-	}
-
-	return newCreatingContainer(
-		containerID,
-		handle.String(),
-		workerName,
-		*metadata,
-		t.conn,
-	), nil
+	return true, nil
 }
 
 func (t *team) FindContainerByHandle(
@@ -250,109 +263,11 @@ func (t *team) FindContainersByMetadata(metadata ContainerMetadata) ([]Container
 		return nil, err
 	}
 
-	defer Close(rows)
-
 	var containers []Container
-	for rows.Next() {
-		creating, created, destroying, _, err := scanContainer(rows, t.conn)
-		if err != nil {
-			return nil, err
-		}
 
-		if creating != nil {
-			containers = append(containers, creating)
-		}
-
-		if created != nil {
-			containers = append(containers, created)
-		}
-
-		if destroying != nil {
-			containers = append(containers, destroying)
-		}
-	}
-
-	return containers, nil
-}
-
-func (t *team) FindCheckContainers(logger lager.Logger, pipelineName string, resourceName string, variablesFactory creds.VariablesFactory) ([]Container, error) {
-	pipeline, found, err := t.Pipeline(pipelineName)
+	containers, err = scanContainers(rows, t.conn, containers)
 	if err != nil {
 		return nil, err
-	}
-	if !found {
-		return []Container{}, nil
-	}
-
-	resource, found, err := pipeline.Resource(resourceName)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return []Container{}, nil
-	}
-
-	pipelineResourceTypes, err := pipeline.ResourceTypes()
-	if err != nil {
-		return nil, err
-	}
-
-	variables := variablesFactory.NewVariables(t.name, pipeline.Name())
-
-	versionedResourceTypes := pipelineResourceTypes.Deserialize()
-
-	source, err := creds.NewSource(variables, resource.Source()).Evaluate()
-	if err != nil {
-		return nil, err
-	}
-
-	resourceConfigFactory := NewResourceConfigFactory(t.conn, t.lockFactory)
-	resourceConfig, found, err := resourceConfigFactory.FindResourceConfig(
-		logger,
-		resource.Type(),
-		source,
-		creds.NewVersionedResourceTypes(variables, versionedResourceTypes),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return []Container{}, nil
-	}
-
-	rows, err := selectContainers("c").
-		Join("worker_resource_config_check_sessions wrccs ON wrccs.id = c.worker_resource_config_check_session_id").
-		Join("resource_config_check_sessions rccs ON rccs.id = wrccs.resource_config_check_session_id").
-		Where(sq.Eq{
-			"rccs.resource_config_id": resourceConfig.ID(),
-			"c.team_id":               t.id,
-		}).
-		RunWith(t.conn).
-		Query()
-	if err != nil {
-		return nil, err
-	}
-
-	defer Close(rows)
-
-	var containers []Container
-	for rows.Next() {
-		creating, created, destroying, _, err := scanContainer(rows, t.conn)
-		if err != nil {
-			return nil, err
-		}
-
-		if creating != nil {
-			containers = append(containers, creating)
-		}
-
-		if created != nil {
-			containers = append(containers, created)
-		}
-
-		if destroying != nil {
-			containers = append(containers, destroying)
-		}
 	}
 
 	return containers, nil
@@ -503,6 +418,16 @@ func (t *team) SavePipeline(
 		if err != nil {
 			return nil, false, err
 		}
+	}
+
+	_, err = tx.Exec(`
+			UPDATE resources
+			SET resource_config_id = NULL
+			WHERE pipeline_id = $1
+			AND active = false
+		`, pipelineID)
+	if err != nil {
+		return nil, false, err
 	}
 
 	for _, resourceType := range config.ResourceTypes {
@@ -674,7 +599,7 @@ func (t *team) OrderPipelines(pipelineNames []string) error {
 			return err
 		}
 		if updatedPipelines == 0 {
-			return errors.New(fmt.Sprintf("pipeline %s does not exist", name))
+			return fmt.Errorf("pipeline %s does not exist", name)
 		}
 	}
 
@@ -711,11 +636,15 @@ func (t *team) PrivateAndPublicBuilds(page Page) ([]Build, Pagination, error) {
 	newBuildsQuery := buildsQuery.
 		Where(sq.Or{sq.Eq{"p.public": true}, sq.Eq{"t.id": t.id}})
 
-	return getBuildsWithPagination(newBuildsQuery, page, t.conn, t.lockFactory)
+	return getBuildsWithPagination(newBuildsQuery, minMaxIdQuery, page, t.conn, t.lockFactory)
+}
+
+func (t *team) BuildsWithTime(page Page) ([]Build, Pagination, error) {
+	return getBuildsWithDates(buildsQuery.Where(sq.Eq{"t.id": t.id}), minMaxIdQuery, page, t.conn, t.lockFactory)
 }
 
 func (t *team) Builds(page Page) ([]Build, Pagination, error) {
-	return getBuildsWithPagination(buildsQuery.Where(sq.Eq{"t.id": t.id}), page, t.conn, t.lockFactory)
+	return getBuildsWithPagination(buildsQuery.Where(sq.Eq{"t.id": t.id}), minMaxIdQuery, page, t.conn, t.lockFactory)
 }
 
 func (t *team) SaveWorker(atcWorker atc.Worker, ttl time.Duration) (Worker, error) {
@@ -763,6 +692,100 @@ func (t *team) UpdateProviderAuth(auth atc.TeamAuth) error {
 	}
 
 	return tx.Commit()
+}
+
+func (t *team) FindCheckContainers(logger lager.Logger, pipelineName string, resourceName string, variablesFactory creds.VariablesFactory) ([]Container, map[int]time.Time, error) {
+	pipeline, found, err := t.Pipeline(pipelineName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !found {
+		return nil, nil, nil
+	}
+
+	resource, found, err := pipeline.Resource(resourceName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !found {
+		return nil, nil, nil
+	}
+
+	pipelineResourceTypes, err := pipeline.ResourceTypes()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	variables := variablesFactory.NewVariables(t.name, pipeline.Name())
+
+	versionedResourceTypes := pipelineResourceTypes.Deserialize()
+
+	source, err := creds.NewSource(variables, resource.Source()).Evaluate()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resourceConfigFactory := NewResourceConfigFactory(t.conn, t.lockFactory)
+	resourceConfig, err := resourceConfigFactory.FindOrCreateResourceConfig(
+		logger,
+		resource.Type(),
+		source,
+		creds.NewVersionedResourceTypes(variables, versionedResourceTypes),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rows, err := selectContainers("c").
+		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
+		Where(sq.Eq{
+			"rccs.resource_config_id": resourceConfig.ID(),
+		}).
+		Distinct().
+		RunWith(t.conn).
+		Query()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var containers []Container
+
+	containers, err = scanContainers(rows, t.conn, containers)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rows, err = psql.Select("c.id", "rccs.expires_at").
+		From("containers c").
+		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
+		Where(sq.Eq{
+			"rccs.resource_config_id": resourceConfig.ID(),
+		}).
+		Distinct().
+		RunWith(t.conn).
+		Query()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer Close(rows)
+
+	checkContainersExpiresAt := make(map[int]time.Time)
+	for rows.Next() {
+		var (
+			id        int
+			expiresAt pq.NullTime
+		)
+
+		err = rows.Scan(&id, &expiresAt)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		checkContainersExpiresAt[id] = expiresAt.Time
+	}
+
+	return containers, checkContainersExpiresAt, nil
 }
 
 func (t *team) saveJob(tx Tx, job atc.JobConfig, pipelineID int, groups []string) error {
@@ -826,11 +849,16 @@ func (t *team) saveResource(tx Tx, resource atc.ResourceConfig, pipelineID int) 
 		return err
 	}
 
-	updated, err := checkIfRowsUpdated(tx, `
+	clearVerQ := ""
+	if resource.Version != nil {
+		clearVerQ = ", api_pinned_version = NULL"
+	}
+
+	updated, err := checkIfRowsUpdated(tx, fmt.Sprintf(`
 		UPDATE resources
-		SET config = $3, active = true, nonce = $4
+		SET config = $3, active = true, nonce = $4 %s
 		WHERE name = $1 AND pipeline_id = $2
-	`, resource.Name, pipelineID, encryptedPayload, nonce)
+	`, clearVerQ), resource.Name, pipelineID, encryptedPayload, nonce)
 	if err != nil {
 		return err
 	}
@@ -916,7 +944,6 @@ func (t *team) findContainer(whereClause sq.Sqlizer) (CreatingContainer, Created
 	creating, created, destroying, _, err := scanContainer(
 		selectContainers().
 			Where(whereClause).
-			Where(sq.Eq{"team_id": t.id}).
 			RunWith(t.conn).
 			QueryRow(),
 		t.conn,
@@ -972,6 +999,33 @@ func scanPipelines(conn Conn, lockFactory lock.LockFactory, rows *sql.Rows) ([]P
 	}
 
 	return pipelines, nil
+}
+
+func scanContainers(rows *sql.Rows, conn Conn, initContainers []Container) ([]Container, error) {
+	containers := initContainers
+
+	defer Close(rows)
+
+	for rows.Next() {
+		creating, created, destroying, _, err := scanContainer(rows, conn)
+		if err != nil {
+			return []Container{}, err
+		}
+
+		if creating != nil {
+			containers = append(containers, creating)
+		}
+
+		if created != nil {
+			containers = append(containers, created)
+		}
+
+		if destroying != nil {
+			containers = append(containers, destroying)
+		}
+	}
+
+	return containers, nil
 }
 
 func (t *team) queryTeam(tx Tx, query string, params ...interface{}) error {

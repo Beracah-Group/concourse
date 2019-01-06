@@ -3,6 +3,8 @@ platform: windows
 
 inputs:
 - name: concourse
+- name: version
+  optional: true
 - name: final-version
   optional: true
 - name: fly-linux
@@ -14,6 +16,9 @@ inputs:
 
 outputs:
 - name: concourse-windows
+
+caches:
+- path: gopath
 
 run:
   path: powershell.exe

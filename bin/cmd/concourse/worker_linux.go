@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"code.cloudfoundry.org/lager"
 	"code.cloudfoundry.org/localip"
@@ -42,6 +43,14 @@ func (cmd *WorkerCommand) gardenRunner(logger lager.Logger) (atc.Worker, ifrit.R
 		return atc.Worker{}, nil, err
 	}
 
+	if binDir := discoverAsset("bin"); binDir != "" {
+		// ensure packaged 'gdn' executable is available in $PATH
+		err := os.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+		if err != nil {
+			return atc.Worker{}, nil, err
+		}
+	}
+
 	depotDir := filepath.Join(cmd.WorkDir.Path(), "depot")
 
 	// must be readable by other users so unprivileged containers can run their
@@ -62,15 +71,11 @@ func (cmd *WorkerCommand) gardenRunner(logger lager.Logger) (atc.Worker, ifrit.R
 		"--bind-port", fmt.Sprintf("%d", cmd.BindPort),
 
 		"--depot", depotDir,
+		"--properties-path", filepath.Join(cmd.WorkDir.Path(), "garden-properties.json"),
 
 		// disable graph and grootfs setup; all images passed to Concourse
 		// containers are raw://
 		"--no-image-plugin",
-		"--graph", "",
-
-		// XXX: we've been setting this the whole time. is it necessary anymore?
-		// XXX: it's probably necessary for testflight
-		"--allow-host-access",
 	}
 
 	gdnServerFlags = append(gdnServerFlags, detectGardenFlags(logger)...)
@@ -103,21 +108,34 @@ func (cmd *WorkerCommand) gardenRunner(logger lager.Logger) (atc.Worker, ifrit.R
 		}
 
 		members = append(members, grouper.Member{
-			Name:   "dns-proxy",
-			Runner: dnsProxyRunner,
+			Name: "dns-proxy",
+			Runner: NewLoggingRunner(
+				logger.Session("dns-proxy-runner"),
+				dnsProxyRunner,
+			),
 		})
 
 		gdnServerFlags = append(gdnServerFlags, "--dns-server", lip)
+
+		// must permit access to host network in order for DNS proxy address to be
+		// reachable
+		gdnServerFlags = append(gdnServerFlags, "--allow-host-access")
 	}
 
 	gdnArgs := append(gdnFlags, append([]string{"server"}, gdnServerFlags...)...)
 	gdnCmd := exec.Command(cmd.Garden.GDN, gdnArgs...)
 	gdnCmd.Stdout = os.Stdout
 	gdnCmd.Stderr = os.Stderr
+	gdnCmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: syscall.SIGKILL,
+	}
 
 	members = append(members, grouper.Member{
-		Name:   "gdn",
-		Runner: cmdRunner{gdnCmd},
+		Name: "gdn",
+		Runner: NewLoggingRunner(
+			logger.Session("gdn-runner"),
+			cmdRunner{gdnCmd},
+		),
 	})
 
 	return worker, grouper.NewParallel(os.Interrupt, members), nil
@@ -193,7 +211,7 @@ func (cmd *WorkerCommand) loadResources(logger lager.Logger) ([]atc.WorkerResour
 				return nil, err
 			}
 
-			t.Image = filepath.Join(basePath, e.Name(), "rootfs")
+			t.Image = filepath.Join(basePath, e.Name(), "rootfs.tgz")
 
 			types = append(types, t)
 		}

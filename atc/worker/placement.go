@@ -3,10 +3,12 @@ package worker
 import (
 	"math/rand"
 	"time"
+
+	"code.cloudfoundry.org/lager"
 )
 
 type ContainerPlacementStrategy interface {
-	Choose([]Worker, ContainerSpec) (Worker, error)
+	Choose(lager.Logger, []Worker, ContainerSpec) (Worker, error)
 }
 
 type VolumeLocalityPlacementStrategy struct {
@@ -19,14 +21,14 @@ func NewVolumeLocalityPlacementStrategy() ContainerPlacementStrategy {
 	}
 }
 
-func (strategy *VolumeLocalityPlacementStrategy) Choose(workers []Worker, spec ContainerSpec) (Worker, error) {
+func (strategy *VolumeLocalityPlacementStrategy) Choose(logger lager.Logger, workers []Worker, spec ContainerSpec) (Worker, error) {
 	workersByCount := map[int][]Worker{}
 	var highestCount int
 	for _, w := range workers {
 		candidateInputCount := 0
 
 		for _, inputSource := range spec.Inputs {
-			_, found, err := inputSource.Source().VolumeOn(w)
+			_, found, err := inputSource.Source().VolumeOn(logger, w)
 			if err != nil {
 				return nil, err
 			}
@@ -48,6 +50,31 @@ func (strategy *VolumeLocalityPlacementStrategy) Choose(workers []Worker, spec C
 	return highestLocalityWorkers[strategy.rand.Intn(len(highestLocalityWorkers))], nil
 }
 
+type LeastBuildContainersPlacementStrategy struct {
+	rand *rand.Rand
+}
+
+func NewLeastBuildContainersPlacementStrategy() ContainerPlacementStrategy {
+	return &LeastBuildContainersPlacementStrategy{
+		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (strategy *LeastBuildContainersPlacementStrategy) Choose(logger lager.Logger, workers []Worker, spec ContainerSpec) (Worker, error) {
+	workersByWork := map[int][]Worker{}
+	var minWork int
+	for i, w := range workers {
+		work := w.BuildContainers()
+		workersByWork[work] = append(workersByWork[work], w)
+		if i == 0 || work < minWork {
+			minWork = work
+		}
+	}
+
+	leastBusyWorkers := workersByWork[minWork]
+	return leastBusyWorkers[strategy.rand.Intn(len(leastBusyWorkers))], nil
+}
+
 type RandomPlacementStrategy struct {
 	rand *rand.Rand
 }
@@ -58,6 +85,6 @@ func NewRandomPlacementStrategy() ContainerPlacementStrategy {
 	}
 }
 
-func (strategy *RandomPlacementStrategy) Choose(workers []Worker, spec ContainerSpec) (Worker, error) {
+func (strategy *RandomPlacementStrategy) Choose(logger lager.Logger, workers []Worker, spec ContainerSpec) (Worker, error) {
 	return workers[strategy.rand.Intn(len(workers))], nil
 }

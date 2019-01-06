@@ -1,6 +1,8 @@
 package worker_test
 
 import (
+	"code.cloudfoundry.org/lager"
+	"code.cloudfoundry.org/lager/lagertest"
 	. "github.com/concourse/concourse/atc/worker"
 	"github.com/concourse/concourse/atc/worker/workerfakes"
 
@@ -24,23 +26,108 @@ var (
 	compatibleWorkerTwoCaches *workerfakes.FakeWorker
 	compatibleWorkerNoCaches1 *workerfakes.FakeWorker
 	compatibleWorkerNoCaches2 *workerfakes.FakeWorker
+
+	logger *lagertest.TestLogger
 )
+
+var _ = Describe("LeastBuildContainersPlacementStrategy", func() {
+	Describe("Choose", func() {
+		var compatibleWorker1 *workerfakes.FakeWorker
+		var compatibleWorker2 *workerfakes.FakeWorker
+		var compatibleWorker3 *workerfakes.FakeWorker
+
+		BeforeEach(func() {
+			logger = lagertest.NewTestLogger("build-containers-equal-placement-test")
+			strategy = NewLeastBuildContainersPlacementStrategy()
+			compatibleWorker1 = new(workerfakes.FakeWorker)
+			compatibleWorker2 = new(workerfakes.FakeWorker)
+			compatibleWorker3 = new(workerfakes.FakeWorker)
+
+			spec = ContainerSpec{
+				ImageSpec: ImageSpec{ResourceType: "some-type"},
+
+				TeamID: 4567,
+
+				Inputs: []InputSource{},
+			}
+		})
+
+		Context("when there is only one worker", func() {
+			BeforeEach(func() {
+				workers = []Worker{compatibleWorker1}
+				compatibleWorker1.BuildContainersReturns(20)
+			})
+
+			It("picks that worker", func() {
+				chosenWorker, chooseErr = strategy.Choose(
+					logger,
+					workers,
+					spec,
+				)
+				Expect(chooseErr).ToNot(HaveOccurred())
+				Expect(chosenWorker).To(Equal(compatibleWorker1))
+			})
+		})
+
+		Context("when there are multiple workers", func() {
+			BeforeEach(func() {
+				workers = []Worker{compatibleWorker2, compatibleWorker3}
+
+				compatibleWorker2.BuildContainersReturns(20)
+				compatibleWorker3.BuildContainersReturns(10)
+			})
+
+			It("picks the one with least amount of containers", func() {
+				Consistently(func() Worker {
+					chosenWorker, chooseErr = strategy.Choose(
+						logger,
+						workers,
+						spec,
+					)
+					Expect(chooseErr).ToNot(HaveOccurred())
+					return chosenWorker
+				}).Should(Equal(compatibleWorker3))
+			})
+
+			Context("when there is more than one worker with the same number of build containers", func() {
+				BeforeEach(func() {
+					workers = []Worker{compatibleWorker1, compatibleWorker2, compatibleWorker3}
+					compatibleWorker1.BuildContainersReturns(10)
+				})
+
+				It("picks any of them", func() {
+					Consistently(func() Worker {
+						chosenWorker, chooseErr = strategy.Choose(
+							logger,
+							workers,
+							spec,
+						)
+						Expect(chooseErr).ToNot(HaveOccurred())
+						return chosenWorker
+					}).Should(Or(Equal(compatibleWorker1), Equal(compatibleWorker3)))
+				})
+			})
+		})
+	})
+})
 
 var _ = Describe("VolumeLocalityPlacementStrategy", func() {
 	Describe("Choose", func() {
 		JustBeforeEach(func() {
 			chosenWorker, chooseErr = strategy.Choose(
+				logger,
 				workers,
 				spec,
 			)
 		})
 
 		BeforeEach(func() {
+			logger = lagertest.NewTestLogger("volume-locality-placement-test")
 			strategy = NewVolumeLocalityPlacementStrategy()
 
 			fakeInput1 := new(workerfakes.FakeInputSource)
 			fakeInput1AS := new(workerfakes.FakeArtifactSource)
-			fakeInput1AS.VolumeOnStub = func(worker Worker) (Volume, bool, error) {
+			fakeInput1AS.VolumeOnStub = func(logger lager.Logger, worker Worker) (Volume, bool, error) {
 				switch worker {
 				case compatibleWorkerOneCache1, compatibleWorkerOneCache2, compatibleWorkerTwoCaches:
 					return new(workerfakes.FakeVolume), true, nil
@@ -52,7 +139,7 @@ var _ = Describe("VolumeLocalityPlacementStrategy", func() {
 
 			fakeInput2 := new(workerfakes.FakeInputSource)
 			fakeInput2AS := new(workerfakes.FakeArtifactSource)
-			fakeInput2AS.VolumeOnStub = func(worker Worker) (Volume, bool, error) {
+			fakeInput2AS.VolumeOnStub = func(logger lager.Logger, worker Worker) (Volume, bool, error) {
 				switch worker {
 				case compatibleWorkerTwoCaches:
 					return new(workerfakes.FakeVolume), true, nil
@@ -123,6 +210,7 @@ var _ = Describe("VolumeLocalityPlacementStrategy", func() {
 
 				for i := 0; i < 100; i++ {
 					worker, err := strategy.Choose(
+						logger,
 						workers,
 						spec,
 					)
@@ -154,6 +242,7 @@ var _ = Describe("VolumeLocalityPlacementStrategy", func() {
 
 				for i := 0; i < 100; i++ {
 					worker, err := strategy.Choose(
+						logger,
 						workers,
 						spec,
 					)
@@ -173,6 +262,7 @@ var _ = Describe("RandomPlacementStrategy", func() {
 	Describe("Choose", func() {
 		JustBeforeEach(func() {
 			chosenWorker, chooseErr = strategy.Choose(
+				logger,
 				workers,
 				spec,
 			)
@@ -195,6 +285,7 @@ var _ = Describe("RandomPlacementStrategy", func() {
 
 			for i := 0; i < 100; i++ {
 				worker, err := strategy.Choose(
+					logger,
 					workers,
 					spec,
 				)

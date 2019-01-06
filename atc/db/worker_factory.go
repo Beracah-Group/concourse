@@ -19,6 +19,9 @@ type WorkerFactory interface {
 	HeartbeatWorker(worker atc.Worker, ttl time.Duration) (Worker, error)
 	Workers() ([]Worker, error)
 	VisibleWorkers([]string) ([]Worker, error)
+
+	FindWorkerForContainerByOwner(ContainerOwner) (Worker, bool, error)
+	BuildContainersCountPerWorker() (map[string]int, error)
 }
 
 type workerFactory struct {
@@ -42,6 +45,7 @@ var workersQuery = psql.Select(`
 		w.https_proxy_url,
 		w.no_proxy,
 		w.active_containers,
+		w.active_volumes,
 		w.resource_types,
 		w.platform,
 		w.tags,
@@ -155,6 +159,7 @@ func scanWorker(worker *worker, row scannable) error {
 		&httpsProxyURL,
 		&noProxy,
 		&worker.activeContainers,
+		&worker.activeVolumes,
 		&resourceTypes,
 		&platform,
 		&tags,
@@ -262,6 +267,7 @@ func (f *workerFactory) HeartbeatWorker(atcWorker atc.Worker, ttl time.Duration)
 	_, err = psql.Update("workers").
 		Set("expires", sq.Expr(expires)).
 		Set("active_containers", atcWorker.ActiveContainers).
+		Set("active_volumes", atcWorker.ActiveVolumes).
 		Set("state", sq.Expr("("+cSQL+")")).
 		Where(sq.Eq{"name": atcWorker.Name}).
 		RunWith(tx).
@@ -315,6 +321,56 @@ func (f *workerFactory) SaveWorker(atcWorker atc.Worker, ttl time.Duration) (Wor
 	return savedWorker, nil
 }
 
+func (f *workerFactory) FindWorkerForContainerByOwner(owner ContainerOwner) (Worker, bool, error) {
+	ownerQuery, found, err := owner.Find(f.conn)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if !found {
+		return nil, false, nil
+	}
+
+	ownerEq := sq.Eq{}
+	for k, v := range ownerQuery {
+		ownerEq["c."+k] = v
+	}
+
+	return getWorker(f.conn, workersQuery.Join("containers c ON c.worker_name = w.name").Where(sq.And{
+		ownerEq,
+	}))
+}
+
+func (f *workerFactory) BuildContainersCountPerWorker() (map[string]int, error) {
+	rows, err := psql.Select("worker_name, COUNT(*)").
+		From("containers").
+		Where("build_id IS NOT NULL").
+		GroupBy("worker_name").
+		RunWith(f.conn).
+		Query()
+	if err != nil {
+		return nil, err
+	}
+
+	defer Close(rows)
+
+	countByWorker := make(map[string]int)
+
+	for rows.Next() {
+		var workerName string
+		var containersCount int
+
+		err = rows.Scan(&workerName, &containersCount)
+		if err != nil {
+			return nil, err
+		}
+
+		countByWorker[workerName] = containersCount
+	}
+
+	return countByWorker, nil
+}
+
 func saveWorker(tx Tx, atcWorker atc.Worker, teamID *int, ttl time.Duration, conn Conn) (Worker, error) {
 	resourceTypes, err := json.Marshal(atcWorker.ResourceTypes)
 	if err != nil {
@@ -355,6 +411,7 @@ func saveWorker(tx Tx, atcWorker atc.Worker, teamID *int, ttl time.Duration, con
 	values := []interface{}{
 		atcWorker.GardenAddr,
 		atcWorker.ActiveContainers,
+		atcWorker.ActiveVolumes,
 		resourceTypes,
 		tags,
 		atcWorker.Platform,
@@ -385,6 +442,7 @@ func saveWorker(tx Tx, atcWorker atc.Worker, teamID *int, ttl time.Duration, con
 			"expires",
 			"addr",
 			"active_containers",
+			"active_volumes",
 			"resource_types",
 			"tags",
 			"platform",
@@ -406,6 +464,7 @@ func saveWorker(tx Tx, atcWorker atc.Worker, teamID *int, ttl time.Duration, con
 				expires = `+expires+`,
 				addr = ?,
 				active_containers = ?,
+				active_volumes = ?,
 				resource_types = ?,
 				tags = ?,
 				platform = ?,
@@ -454,6 +513,7 @@ func saveWorker(tx Tx, atcWorker atc.Worker, teamID *int, ttl time.Duration, con
 		httpsProxyURL:    atcWorker.HTTPSProxyURL,
 		noProxy:          atcWorker.NoProxy,
 		activeContainers: atcWorker.ActiveContainers,
+		activeVolumes:    atcWorker.ActiveVolumes,
 		resourceTypes:    atcWorker.ResourceTypes,
 		platform:         atcWorker.Platform,
 		tags:             atcWorker.Tags,

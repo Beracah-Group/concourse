@@ -15,6 +15,7 @@ type Route
     | Pipeline String String
     | Dashboard
     | DashboardHd
+    | FlySuccess
 
 
 type alias ConcourseRoute =
@@ -64,6 +65,11 @@ dashboardHd =
     DashboardHd := static "hd"
 
 
+flySuccess : Route.Route Route
+flySuccess =
+    FlySuccess := static "fly_success"
+
+
 
 -- route utils
 
@@ -83,7 +89,7 @@ jobRoute j =
     (Job j.teamName j.pipelineName j.name) |> toString
 
 
-pipelineRoute : Concourse.Pipeline -> String
+pipelineRoute : { a | name : String, teamName : String } -> String
 pipelineRoute p =
     (Pipeline p.teamName p.name) |> toString
 
@@ -112,6 +118,7 @@ sitemap =
         , pipeline
         , dashboard
         , dashboardHd
+        , flySuccess
         ]
 
 
@@ -145,6 +152,9 @@ toString route =
         DashboardHd ->
             reverse dashboardHd []
 
+        FlySuccess ->
+            reverse flySuccess []
+
 
 parsePath : Location -> ConcourseRoute
 parsePath location =
@@ -157,7 +167,13 @@ parsePath location =
         search =
             QueryString.one QueryString.string "search" queries
                 |> Maybe.withDefault ""
-                |> String.map (\c -> if c == '+' then ' ' else c)
+                |> String.map
+                    (\c ->
+                        if c == '+' then
+                            ' '
+                        else
+                            c
+                    )
 
         cleanedQueries =
             case search of

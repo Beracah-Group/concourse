@@ -1,7 +1,5 @@
-trap {
-  write-error $_
-  exit 1
-}
+$ErrorActionPreference = "Stop"
+trap { $host.SetShouldExit(1) }
 
 $env:Path += ";C:\Go\bin;C:\Program Files\Git\cmd"
 
@@ -15,3 +13,5 @@ go mod download
 go install github.com/onsi/ginkgo/ginkgo
 
 ginkgo -r -p
+
+Exit $LastExitCode
